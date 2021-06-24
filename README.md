@@ -8,4 +8,5 @@ Specifically, this software generates two random binary matrices B and C and a m
 The repository contains two files:
 
 1- kron.mlapp: a MATLAB implementation of the heuristic providing a GUI
+
 2- kron.txt: the source code of the application
