@@ -1,0 +1,1728 @@
+classdef kron_App_published < matlab.apps.AppBase
+
+    % Properties that correspond to app components
+    properties (Access = public)
+        figure1                    matlab.ui.Figure
+        kronFactorsPanel           matlab.ui.container.Panel
+        Blabel                     matlab.ui.control.Label
+        Clabel                     matlab.ui.control.Label
+        DensityLabel               matlab.ui.control.Label
+        densityB                   matlab.ui.control.Spinner
+        densityC                   matlab.ui.control.Spinner
+        DimensionEditFieldLabel    matlab.ui.control.Label
+        dimBNum                    matlab.ui.control.NumericEditField
+        dimCNum                    matlab.ui.control.NumericEditField
+        statsPanel                 matlab.ui.container.Panel
+        statsContentHtml           matlab.ui.control.HTML
+        solvePanel                 matlab.ui.container.Panel
+        generateButton             matlab.ui.control.Button
+        showStepsCkb               matlab.ui.control.CheckBox
+        solveButton                matlab.ui.control.Button
+        solveBatchPanel            matlab.ui.container.Panel
+        NumberofproblemsLabel      matlab.ui.control.Label
+        numProblems                matlab.ui.control.NumericEditField
+        VariationsperproblemLabel  matlab.ui.control.Label
+        numVariations              matlab.ui.control.NumericEditField
+        solveBatchButton           matlab.ui.control.Button
+        graphPanel                 matlab.ui.container.Panel
+        bipartiteCkb               matlab.ui.control.CheckBox
+        connectedCkb               matlab.ui.control.CheckBox
+        NumberofconnectedcomponentsLabel  matlab.ui.control.Label
+        numComponents              matlab.ui.control.NumericEditField
+        mainFigure                 matlab.ui.control.UIAxes
+        BFigure                    matlab.ui.control.UIAxes
+        CFigure                    matlab.ui.control.UIAxes
+        AFigure                    matlab.ui.control.UIAxes
+        myBFigure                  matlab.ui.control.UIAxes
+        myCFigure                  matlab.ui.control.UIAxes
+        myAFigure                  matlab.ui.control.UIAxes
+        metric1Figure              matlab.ui.control.UIAxes
+        metric3Figure              matlab.ui.control.UIAxes
+        frobeniusErrorFigure       matlab.ui.control.UIAxes
+        errorFigure                matlab.ui.control.UIAxes
+    end
+
+    
+    properties (Access = public)
+        A % Matrix to be factorized
+        dimA % Dimension of A
+        dimB % Dimension of B
+        dimC % Dimension of C
+        denB % Density of elements set to one in B
+        denC % Density of elements set to one in C
+        numProb % Number of distinct problems to be solved (batch solve)
+        numVars % Number of variations (random permutations) for each problem (batch solve)
+        imHandle % Handle of the main image
+        perturbate_every = 5; % each perturbate_every times the metric is swapped, A is completely perturbed; similarly, each perturbate_every times best_swaps are exhausted, a small perturbation is performed
+        maxrestarts = 10; % max number of complete perturbations (the experiment terminates), max number of times the process has been restarted after a local minima
+        maxiter = 500; % max number of Alternate Local Search iterations
+        maxiter_cornerize = 100; % max number of iterations of the cornerize procedure (onion search)
+        maxiter_onion % max number of iterations of the onion search procedure
+        totalTimeGrouping = 0; % total execution time of the kronGrouping procedure
+        block_matrix = false; % true: A is divided into dimB x dim B blocks of dimension dimC x dimC such that each block is completely empty or considerably filled (false: o.w.)
+        cornerized_matrix = false; % true: A was processed by onion_search procedure and blocks were consequntly rearranged in a top-left fashion (false: o.w.)
+        best_count = 1; % each best_count iterations best_swaps are computed again
+        debug_mode = 0; % print some debug information in the bottom right html box
+    end
+    
+    methods (Access = private)
+        %% M: the matrix to be plotted
+        %% step: print step for blocks guidelines
+        %% name: name of the matrix to be printed on top
+        function handle = print_matrix(~, figId, M, dimM, step, name)
+             handle = imagesc(figId,(1:dimM)+0.5, (1:dimM)+0.5, M);
+             axis equal
+             set(figId, 'XTick', (1:step:(dimM+1)), 'XTickLabel', [], 'YTick', (1:step:(dimM+1)), 'YTickLabel', [], 'XLim', [1 dimM+1], 'YLim', [1 dimM+1], 'GridLineStyle', '-', 'XGrid', 'on', 'YGrid', 'on', 'GridColor','r','LineWidth',2,'GridAlpha',0.5)
+             title(figId, sprintf("%s (%d x %d)", name, dimM, dimM));
+        end
+    
+        
+        %% Returns true if the graph corresponding to the input adjacency matrix is bipartite, false o.w.
+        function result = is_bipartite(~, M)
+        
+            G = digraph(M);
+            events = {'edgetonew', 'edgetodiscovered', 'edgetofinished'};
+            T = bfsearch(G, 1, events, 'Restart', true);
+            partitions = false(1, numnodes(G));
+            result = true;
+            is_edgetonew = T.Event == 'edgetonew';
+            ed = T.Edge;
+            
+            for ii=1:size(T, 1)   
+                if is_edgetonew(ii)
+                    partitions(ed(ii, 2)) = ~partitions(ed(ii, 1));
+                else
+                    if partitions(ed(ii, 1)) == partitions(ed(ii, 2))
+                        result = false;
+                        break;
+                    end
+                end
+            end            
+        end
+        
+        
+        %% Returns a matrix representing the disjoint union of numComponents graphs
+        function B = disjoint_union(app, dimB, nComp)
+        
+            q = fix(dimB/nComp);
+            r = rem(dimB,nComp);
+            comps = q*ones(1,nComp);
+            comps(1) = comps(1) + r;
+            B = zeros(dimB);
+            idx = 1;
+            for i=1:nComp
+                dimS = comps(i);
+                % generate submatrix
+                S=randsrc(dimS,dimS,[0 1 ; 1-app.denB app.denB]);
+                % inflate it on the B diagonal
+                B(idx:idx+dimS-1,idx:idx+dimS-1) = S;
+                idx = idx+dimS;
+            end
+        end
+        
+        
+        %% Performs a first rearrangement of the input matrix in order to group elements set to one in blocks.
+        function [result, timeGrouping] = kron_grouping(app, M)
+        
+            %% array of permutations (6 possible cases)
+            perm = zeros(6,app.dimA);
+            M0 = zeros(app.dimA);
+            M1 = zeros(app.dimA);
+            
+            % value of metric1 before grouping
+            if(app.debug_mode)
+                val1 = app.metric1(M,app.dimB,app.dimC);
+            end
+            
+            ticGroup = tic();
+            
+            % computes M0 and M1 
+            % each entry represents the similarity between row_i, row_j, col_i, col_j
+            % M0 measures the zeros similarity, M1 the ones similarity
+            for i=1:app.dimA
+                for j=1:app.dimA
+                    if(i==j)
+                        M0(i,j) = 0;
+                        M1(i,j) = 0;
+                    else
+                        M0(i,j) = app.simil(M(i,:),M(j,:)) + app.simil(1-M(i,:),1-M(j,:));
+                        M1(i,j) = app.simil(M(:,i),M(:,j)) + app.simil(1-M(:,i),1-M(:,j));
+                    end
+                end
+            end
+           
+            k=1;
+            for w=0:0.2:1
+                MS = w*M0 + (1-w)*M1;
+                cur_perm = zeros(1,app.dimA);
+                q=1;
+                for i=1:app.dimA
+                    if(any(i==cur_perm))
+                        continue
+                    else
+                        cur_perm(q) = i;
+                        cur_row = MS(i,:);
+                        [~,idxs] = sort(cur_row,'descend');
+                        % select the dimC-1 best indices for the pivot i
+                        c = 1;
+                        for j=1:app.dimA
+                            if(any(idxs(j)==cur_perm))
+                                continue
+                            else
+                                cur_perm(q+c) = idxs(j);
+                                c = c + 1;
+                                if(c > app.dimC-1)
+                                    break
+                                end
+                            end
+                        end
+                        q = q + app.dimC;
+                        if(q > app.dimA)
+                            break
+                        end
+                    end
+                end
+                perm(k,:) = cur_perm;
+                k = k + 1;
+            end
+            
+            
+            %% select the best among the six permutations relying on metric1
+            max_val = 0;
+            for k=1:6
+                tempA = M(perm(k,:),perm(k,:));
+                val2 = app.metric1(tempA, app.dimB, app.dimC);
+                if(val2 > max_val)
+                    max_val = val2;
+                    best_perm = perm(k,:);
+                end
+            end
+          
+            timeGrouping = toc(ticGroup);
+          
+            if(app.debug_mode)
+                htmlContent = strcat("<b>M1 before grouping: ", num2str(val1), "<br/><br/>M1 after grouping: ", num2str(max_val), "</b><br/><br/>Factor of improvement: ", num2str(max_val/val1));
+                app.statsContentHtml.HTMLSource = htmlContent;
+            end
+            
+            result = best_perm;
+            
+        end
+        
+        
+        
+        %% Find the swaps that are more likely to be convenient.
+        function [result, timeOutsiders] = outsiders(app, M)
+        
+            outsTic = tic();
+            N = app.dimC*ones(1,app.dimB);
+            R = mat2cell(M,N,N);
+            
+            array_sums = zeros(1,app.dimB*app.dimB);
+            mat_sums = zeros(app.dimB,app.dimB);
+            mat_density = zeros(app.dimB,app.dimB);
+            
+            % sums elements set to one in each submatrix (block)
+            k = 1;
+            for i=1:app.dimB
+                for j=1:app.dimB
+                    array_sums(k) = sum(R{i,j},'all');
+                    mat_sums(i,j) = array_sums(k);
+                    mat_density(i,j) = mat_sums(i,j)/(app.dimC*app.dimC);
+                    k = k+1;
+                end
+            end
+            avgSums = mean(array_sums);
+            
+            % rows weights (block based)
+            WR = zeros(app.dimA,app.dimB);
+            % cols weights (block based)
+            WC = zeros(app.dimB,app.dimA);
+            
+            % for each block
+            for i=1:app.dimB
+                % for each block
+                for j=1:app.dimB
+                    % parts of row / col
+                    for k=1:app.dimC
+                        sum_row_part = sum(R{i,j}(k,:),'all');
+                        sum_col_part = sum(R{i,j}(:,k),'all');
+                        if(mat_sums(i,j)<avgSums)
+                            WR(((i-1)*app.dimC)+k,j) = sum_row_part;
+                            WC(i,((j-1)*app.dimC)+k) = sum_col_part;
+                        else
+                            WR(((i-1)*app.dimC)+k,j) = -(app.dimC-sum_row_part);
+                            WC(i,((j-1)*app.dimC)+k) = -(app.dimC-sum_col_part);
+                        end
+                    end
+                end
+            end
+           
+           RS = zeros(app.dimA);
+           CS = zeros(app.dimA);
+            
+           % for each row
+           for i=1:app.dimA
+               idx_block_i = fix((i-1)/app.dimC)+1;
+               % for each other row
+               for j=1:app.dimA
+                   idx_block_j = fix((j-1)/app.dimC)+1;
+                   % if i and j fall in the same block, skip
+                   if(idx_block_i==idx_block_j)
+                       continue;
+                   end
+                   % for each block
+                   for b=1:app.dimB
+                       
+                       % Evaluates meaningful swaps only: if the part
+                       % of row i is in a block "to be filled", computes the
+                       % weights multiplication only if the part of row j
+                       % falls in a block "to be emptied" and vice versa.
+                       % A smoothing factor is applied depending on the
+                       % block density (concerning the block to be filled):
+                       % the ideal swap is the one performed among a block
+                       % to be emptied and a block to be filled which
+                       % is not too dense.
+                       if(mat_sums(idx_block_i,b) < avgSums && mat_sums(idx_block_j,b) >= avgSums)
+                           RS(i,j) = RS(i,j) + (WR(i,b) * WR(j,b) * (1-mat_density(idx_block_j,b)).^2 );
+                       elseif(mat_sums(idx_block_i,b) >= avgSums && mat_sums(idx_block_j,b) < avgSums)
+                           RS(i,j) = RS(i,j) + (WR(i,b) * WR(j,b) * (1-mat_density(idx_block_i,b)).^2 );
+                       end
+                       if(mat_sums(b,idx_block_i) < avgSums && mat_sums(b,idx_block_j) >= avgSums)
+                           CS(i,j) = CS(i,j) + (WC(b,i) * WC(b,j) * (1-mat_density(b,idx_block_j)).^2 );
+                       elseif(mat_sums(b,idx_block_i) >= avgSums && mat_sums(b,idx_block_j) < avgSums)
+                           CS(i,j) = CS(i,j) + (WC(b,i) * WC(b,j) * (1-mat_density(b,idx_block_i)).^2 );
+                       end
+                       
+                   end
+               end
+           end
+            
+           MS = RS + CS;
+           
+           if(sum(MS,'all')==0)
+               % in this case each block of the matrix having a number of ones under average is completely empty
+               % the matrix is thus considered a "block matrix" from now
+               % onward; no need to call outsiders procedure anymore
+               app.block_matrix = true;
+               swaps = [];
+           else
+               swaps = zeros(app.dimA*app.dimA,3);
+               nswaps=0;
+               for i=1:app.dimA
+                   for j=i:app.dimA
+                       if(MS(i,j) ~= 0)
+                           nswaps = nswaps+1;
+                           swaps(nswaps,:) = [i,j,MS(i,j)];
+                       end
+                   end
+               end
+               swaps = swaps(1:nswaps,1:3);
+               swaps = sortrows(swaps,3,'ascend');
+               swaps = [swaps(:,1),swaps(:,2)];
+           end
+           
+           timeOutsiders = toc(outsTic);
+           result = swaps';  
+        end
+        
+        
+        
+        %% Rearrange blocks of the block matrix in a top-left fashion
+        function myO = cornerize(app, M)
+            
+            N = app.dimC*ones(1,app.dimB);
+            R = mat2cell(M,N,N);
+            
+            % defines which block is filled and which is empty (1: filled, 0: empty)
+            BLOCKS = zeros(app.dimB,app.dimB);
+            num_blocks = 0;
+            for i=1:app.dimB
+                for j=1:app.dimB
+                    if(sum(R{i,j},'all') > 0)
+                        BLOCKS(i,j) = 1;
+                        num_blocks = num_blocks + 1;
+                    else
+                        BLOCKS(i,j) = 0;
+                    end
+                end
+            end
+
+            % weights matrix (the bigger the more the block is near to the top left corner)
+            W = zeros(app.dimB,app.dimB);
+            for i=1:app.dimB
+                for j=1:app.dimB
+                    W(i,j) = (app.dimB+1-max(i,j)).^3;
+                end
+            end
+            
+            % computes the optimum value for the local search
+            cornerize_opt_val = 0;
+            for i=1:app.dimB
+                if(num_blocks <= 0)
+                    break;
+                end
+                v = (i*2)-1;
+                for j=1:v
+                    if(num_blocks > 0)
+                        cornerize_opt_val = cornerize_opt_val + (app.dimB+1-i).^3;
+                    else
+                        break;
+                    end
+                    num_blocks = num_blocks - 1;
+                end
+            end
+            
+            
+            % starting value
+            cornerize_best_val = sum(dot(BLOCKS,W),'all');
+            best_R = R;
+            
+            % array of each possible block swap
+            base_swaps = nchoosek(1:app.dimB,2)';
+              
+            for it=1:app.maxiter_cornerize
+                
+                improved = false;
+                % swaps randomization
+                p = randperm(width(base_swaps));
+                swaps = base_swaps(:,p);
+                
+                for idx = 1:width(swaps)
+                    p = swaps(:,idx);
+                    cur_perm = 1:app.dimB;
+                    cur_perm(p) = cur_perm(flip(p)); 
+                    test_B = BLOCKS(cur_perm, cur_perm);
+                    
+                    % computes the new val after the swap was applied
+                    cornerize_cur_val = sum(dot(test_B,W),'all');
+                  
+                    if (cornerize_cur_val > cornerize_best_val)
+                      cornerize_best_val = cornerize_cur_val;
+                      R = R(cur_perm, cur_perm);
+                      BLOCKS = test_B;
+                      best_R = R;
+                      improved = true;
+                      break; %% stop after the first "good" result
+                    end
+                end
+                
+                if(app.showStepsCkb.Value && improved)
+                    set(app.imHandle, 'CData', cell2mat(best_R));
+                    drawnow
+                end
+                
+                % when the current val reaches the 75% of the opt val, stop
+                % the procedure
+                if((0.75 * cornerize_opt_val) < cornerize_best_val)
+                    break;
+                end
+                
+                if(~improved)
+                    % apply a perturbation
+                    cur_perm = app.k_vec_shuffle(cur_perm, round(0.55*app.dimB));
+                    R = R(cur_perm, cur_perm);
+                    BLOCKS = BLOCKS(cur_perm, cur_perm);
+                end
+                
+            end
+            
+            
+            % restore the original matrix from the block matrix
+            myO = cell2mat(best_R);
+            
+            if(app.showStepsCkb.Value)
+                set(app.imHandle, 'CData', myO);
+                drawnow
+            end
+            
+        end
+        
+        
+        
+        %% Perform a local search based on metric1 following a layer-by-layer procedure
+        %% Layers rely on the block matrix; the first layer (1x1 top-left block) is 
+        %% implicitly factorized and is used as template
+        function [result, timeOnion, success, bestFrobErr] = onion_search(app, M)
+        
+            onionTic = tic();
+            
+            myO = app.cornerize(M);
+            
+            % as the first layer is implicitly factorized, we start from
+            % the second one
+            settledLayers = 1;
+            curLayer = 2;
+            if(app.showStepsCkb.Value)
+                %% add an overlay on the first layer
+                mask = ones(app.dimA);
+                mask(1:app.dimC,1:app.dimC) = zeros(app.dimC)+0.5;
+                set(app.imHandle, 'AlphaData', mask);
+                drawnow
+            end
+            
+            % local search layer-by-layer
+            for i=curLayer:app.dimB
+                
+                [success, myO, bestFrobErr] = app.localSearchSubmatrix(myO, i, settledLayers);
+                
+                if(success)
+                    % when the procedure succeed, the matrix is factorized to the curLayer (i) included
+                    % i.e. each block included in the layers 1-i are empty or equal each other
+                    settledLayers = i;
+                    
+                    if(app.showStepsCkb.Value)
+                        %% add overlays on settled (factorized) layers
+                        mask = ones(app.dimA); 
+                        mask(1:i*app.dimC,1:i*app.dimC) = zeros(i*app.dimC)+0.5;
+                        set(app.imHandle, 'AlphaData', mask);
+                        drawnow
+                    end
+                    
+                end
+            end
+            
+            if(app.showStepsCkb.Value)
+                %% end onion search, remove overlays
+                mask = ones(app.dimA);
+                set(app.imHandle, 'AlphaData', mask);
+                drawnow
+            end
+            
+            % if the last call to localSearchSubmatrix succeeded, each layer of the matrix is correctly factorized
+            % thus, the kron factorization problem is solved globally
+            % otherwise, we go back to the alternateLocalSearch
+           timeOnion = toc(onionTic);
+           result = myO;  
+        end
+        
+        
+        
+        % https://doi.org/10.1007/978-94-015-8196-7_17
+        function [ B, C, D ] = NearestKroneckerProduct(~, M, SizeB, SizeC, Hermitian ) 
+            m = size( M, 1 );
+            n = size( M, 2 );
+            m1 = SizeB( 1 );
+            n1 = SizeB( 2 );
+            m2 = SizeC( 1 );
+            n2 = SizeC( 2 );
+            
+            %if nargin < 5
+            %    Hermitian = false;
+            %end
+        
+            assert( m == m1 * m2 );
+            assert( n == n1 * n2 );
+            
+            if Hermitian
+                assert( m1 == n1 );
+                assert( m2 == n2 );
+                M = 0.5 * ( M + M' );
+            end
+            
+            R = reshape( permute( reshape( M, [ m2, m1, n2, n1 ] ), [ 2 4 1 3 ] ), m1 * n1, m2 * n2 );
+            
+            [ B, S, C ] = svds( R, 1 );
+            
+            SqrtS = sqrt( S );
+            
+            B = reshape( B * SqrtS, m1, n1 );
+            C = reshape( C * SqrtS, m2, n2 );
+            
+            if Hermitian
+                B = 0.5 * ( B + B' );
+                C = 0.5 * ( C + C' );
+                
+                if all( diag( B ) < 0 ) && all( diag( C ) < 0 )
+                    B = -B;
+                    C = -C;
+                end
+            end
+            
+            if nargout > 2
+                D = M - kron( B, C );
+                if Hermitian
+                    D = 0.5 * ( D + D' );
+                end
+            end
+        end
+        
+        %% Returns a copy of v where a subset of k randomly chosen elements is permuted.
+        function result = k_vec_shuffle(~, v, k)
+          assert( isvector(v) );
+          assert( isscalar(k) );
+          n = length(v);
+          idx = randperm(n, k);
+          idx_new = idx(randperm(k));
+          result = v;
+          result(idx_new) = result(idx);
+        end
+   
+        %% Randomly exchange k rows/columns of A; returns a new matrix Anew
+        function Anew = k_mat_shuffle(~, A, k)
+          idx = app.k_vec_shuffle(1:height(A), k);
+          Anew = A(idx, idx);
+        end
+        
+        %% Compute the discrepancy of matrix A with respect to the Kronecker
+        %% product kron(B, C). A, B, C must be binary matrices; the result is
+        %% the fraction of elements of (A - kron(B, C)) that are different
+        %% than zero. Therefore, the result is a real number in the range [0,
+        %% 1], where 0=no difference, 1=all elements differ.
+        function result = kron_error(~, A, B, C)
+          assert( all( size(A) == size(B) .* size(C) ) );
+          absval = abs(A - kron(B, C));
+          result = sum(absval(:)) / numel(A);
+        end
+   
+        
+        %% computes the similarity between two arrays
+        function result = simil( ~, v1, v2)
+            s1 = sum(v1, 'all');
+            s2 = sum(v2, 'all');
+            s_prod = sum(dot(v1,v2),'all');
+            result = (s_prod/(s1+s2+1)).^2;
+        end
+        
+        
+        %% metric1
+        %% square sum of the input matrix multiplied with its transpose, block by block
+        function result = metric1( ~, A, SizeB, SizeC )
+          %% square matrices only
+          R = reshape( permute( reshape( A, [ SizeC, SizeB, SizeC, SizeB ] ), [ 2 4 1 3 ] ), SizeB * SizeB, SizeC * SizeC );
+          RtimesR = (R * R');
+          result = sum( RtimesR(:).^2 );
+        end
+        
+        %% metric3
+        %% computes the variance of the sum of elements block by block
+        function result = metric3(~, A, dimB, dimC)
+         %% divides A in dimB*dimB blocks of dimension dimC*dimC
+         N = dimC*ones(1,dimB);
+         R = mat2cell(A,N,N);  
+         array_sums = zeros(1,dimC*dimC);
+         
+         k = 1;
+         for i=1:dimB
+             for j=1:dimB
+                 array_sums(k) = sum(R{i,j},'all');
+                 k = k+1;
+             end
+         end
+         %% returns the variance, to be maximized
+         result = var(array_sums);
+        end
+        
+        
+        
+        % checks if the block matrix derived from the input matrix is
+        % composed only by empty blocks or by blocks sharing the same
+        % number of ones
+        function blocks = checkBlocks(app, myA)
+
+            blocks = true;
+            pivot = 0;
+            
+            % derive the block matrix
+            N = app.dimC * ones(1,app.dimB);
+            R = mat2cell(myA,N,N);
+            
+            for i=1:app.dimB
+                for j=1:app.dimB
+                    cur_sum = sum(R{i,j},'all');
+                    if(pivot == 0 && cur_sum ~= 0)
+                        pivot = cur_sum;
+                    end
+                    if(cur_sum ~= 0 && cur_sum ~= pivot)
+                        blocks = false;
+                        return
+                    end
+                end
+            end
+        end
+        
+        
+        
+        
+        % myA: whole matrix (only a part of it will be altered)
+        % cur_layer: current working layer in the onion_search
+        % ok_layer: the last settled layer in onion_search
+        function [success, best_A, best_frobErr] = localSearchSubmatrix(app, myA, cur_layer, ok_layer)
+          
+          hermitian = false;
+          iter = 0;
+          best_A = myA;
+          layers = cur_layer - ok_layer;
+          
+          %% important!
+          %% allowed swaps are limited to the rows/cols falling in the range [ok_layer+1, cur_layer]
+          all_idx = 1:(cur_layer*app.dimC);
+          ok_idx = 1:(ok_layer*app.dimC);
+          indexes = setdiff(all_idx,ok_idx);
+          base_swaps = nchoosek(indexes,2)';
+          
+          %% important!
+          %% metric and errors are limited to the submatrix defined by blocks [1, cur_layer]
+          best_submatrix = best_A(1:(cur_layer*app.dimC), 1:(cur_layer*app.dimC));
+          max_val = app.metric1(best_submatrix, cur_layer, app.dimC);
+          
+          while (iter <= (app.maxiter_onion*layers))
+            iter = iter + 1;
+            improved = false;
+            
+            swaps = base_swaps;
+            p = randperm(width(swaps));
+            swaps = swaps(:,p);
+            
+            for idx = 1:width(swaps)
+              p = swaps(:,idx);
+              cur_perm = 1:app.dimA;
+              cur_perm(p) = cur_perm(flip(p));
+              test_A = best_A(cur_perm, cur_perm);
+          
+              submatrix = test_A(1:(cur_layer*app.dimC), 1:(cur_layer*app.dimC));
+              val = app.metric1(submatrix, cur_layer, app.dimC);
+              
+              if (val > max_val)
+                max_val = val;
+                best_A = best_A(cur_perm, cur_perm);
+                best_submatrix = submatrix;
+                improved = true;
+                break; %% stop after the first "good" result
+              end
+            end
+            
+            [~, ~, errMatrix] = app.NearestKroneckerProduct(best_submatrix, [cur_layer cur_layer], [app.dimC app.dimC], hermitian);
+            best_frobErr = norm(errMatrix, 'fro');
+            
+            if(app.showStepsCkb.Value)
+                set(app.imHandle, 'CData', best_A);
+                drawnow
+            end
+            
+            if (~improved)
+                % if the entire set of swaps was tested without improvements,
+                % the local search terminates with success = false;
+                break;
+            end
+            
+            %% if the error is very small, the local search succeeded
+            if (best_frobErr < 1e-6)
+                break;
+            end
+          end
+          success = (best_frobErr < 1e-6);
+        end
+        
+        
+        
+        
+        %% OUTPUTS:
+        %%
+        %% success    : true iff optimal solution found
+        %% best_A     : "best" permutation of A
+        %% B, C       : "best" candidate factors (binary matrices)
+        %% iter       : number of steps to success
+        %% errors     : array(maxiter) of errors for stats%
+        %% frobErrors : array(maxiter) of Frobenius Errors for stats
+        %% elapsed    : elapsed time
+        function [success, best_A, B, C, errors, frobErrors, val_m1, val_m3, iter, iterm1, iterm3, elapsed, elapsedm1, elapsedm3, elapsedOutsiders, timeOnion] = alternateLocalSearch(app, myA)
+          
+          max_val = -inf;
+          errors = nan(1,app.maxiter);
+          frobErrors = nan(1,app.maxiter);
+          val_m1 = nan(1,app.maxiter);
+          val_m3 = nan(1,app.maxiter);
+          hermitian = false;
+          iter = 0;
+          iterm1 = 0;
+          iterm3 = 0;
+          elapsedm1 = 0;
+          elapsedm3 = 0;
+          timeOutsiders_m1 = 0;
+          timeOutsiders_m3 = 0;
+          timeOnion_m1 = 0;
+          timeOnion_m3 = 0;
+          timeGrouping_m1 = 0;
+          timeGrouping_m3 = 0;
+          %% number of times the process has been restarted after a local minima
+          nrestarts = 0;
+        
+          %% id of the current metric used to evaluate the local search (1 or 3)
+          curMetric = 3;
+          %% true if metric 3 reached a satisfying value (we swap to metric 1)
+          break_metric3 = false;
+          %% average number of elements set to one per block
+          avgSum = sum(app.A,'all')/(app.dimB*app.dimB);
+          %% maximum number of elements set to one per block
+          mu_max = app.dimC*app.dimC;
+          %% parameter used to check when we can stop using metric3
+          k = (1+(2*avgSum/mu_max)+(min(app.dimB,app.dimC)/max(app.dimB,app.dimC)))*min(app.dimB,app.dimC);
+        
+          app.block_matrix = false;
+          app.cornerized_matrix = false;
+          best_A = myA;
+          
+          %% list of possible swaps (all combinations of [1:dimA] taken two at a time)
+          base_swaps = nchoosek(1:app.dimA,2)';
+          basw = width(base_swaps);
+          best_swaps = [];
+          best_swaps_exhausted_flag = app.perturbate_every;
+          
+          totalTime = tic();
+          
+          % main loop
+          while (iter <= app.maxiter)
+            iter = iter + 1;
+            improved = false;
+                        
+            % If the matrix is still not in a block form, search those swaps
+            % that are more likely to be convenient.
+            % They will be prepended to the base_swaps array
+            if(~app.block_matrix)
+                if(rem(iter-1,app.best_count)==0)
+                    [best_swaps, timeOutsiders] = app.outsiders(best_A);
+                    
+                    if(curMetric==1)
+                        timeOutsiders_m1 = timeOutsiders_m1 + timeOutsiders;
+                    end
+                    if(curMetric==3)
+                        timeOutsiders_m3 = timeOutsiders_m3 + timeOutsiders;
+                    end
+                end
+            end
+            
+            if(~app.cornerized_matrix && app.block_matrix)
+                % Before starting the onion search procedure,
+                % check whether the blocks of the block matrix are in a
+                % feasible form to be factorized.
+                % If not, apply a perturbation
+                blocks = app.checkBlocks(best_A);
+                
+                if(~blocks)
+                    pmt = 1:app.dimA;
+                    pmt = app.k_vec_shuffle(pmt, round(0.75*app.dimA));
+                    best_A = best_A(pmt, pmt);
+                    [pmt, timeG] = app.kron_grouping(best_A);
+                    best_A = best_A(pmt, pmt);
+                    app.totalTimeGrouping = app.totalTimeGrouping + timeG;
+                    app.block_matrix = false;
+                    
+                    if(app.debug_mode)
+                        htmlContent = strcat("<b>PARTIAL RESHUFFLE:</b><br/><br/>Scope: before Onion Search<br/>Current metric: ", num2str(curMetric));
+                        app.statsContentHtml.HTMLSource = htmlContent;
+                    end
+                end
+                
+                if(~blocks && curMetric == 1)
+                    max_val = app.metric1(best_A, app.dimB, app.dimC);
+                    timeGrouping_m1 = timeGrouping_m1 + timeG;
+                end
+                if(~blocks && curMetric == 3)
+                    max_val = app.metric3(best_A, app.dimB, app.dimC);
+                    timeGrouping_m3 = timeGrouping_m3 + timeG;
+                end
+                
+                if(app.showStepsCkb.Value)
+                    set(app.imHandle, 'CData', best_A);
+                    drawnow
+                end
+                
+            end
+            
+            if(~app.cornerized_matrix && app.block_matrix)
+                % if A is a block matrix and blocks are in a feasible form
+                % starts the onion search
+                [best_A, timeOnion, scs, onionFrobErr] = app.onion_search(best_A);
+                app.cornerized_matrix = true;
+            
+                [B, C, ~] = app.NearestKroneckerProduct(best_A, [app.dimB app.dimB], [app.dimC app.dimC], hermitian);
+                best_err = app.kron_error(best_A, B, C);
+                errors(iter) = best_err;
+                best_frobErr = onionFrobErr;
+                frobErrors(iter) = best_frobErr;
+                
+                if(curMetric==1)
+                    val = app.metric1(best_A, app.dimB, app.dimC);
+                    if(val>max_val)
+                        max_val=val;
+                    end
+                    val_m1(iter) = max_val;
+                    timeOnion_m1 = timeOnion_m1 + timeOnion;
+                end
+                if(curMetric==3)
+                    val = app.metric3(best_A, app.dimB, app.dimC);
+                    if(val>max_val)
+                        max_val=val;
+                    end
+                    val_m3(iter) = max_val;
+                    timeOnion_m3 = timeOnion_m3 + timeOnion;
+                end
+                
+                % if onion_search succeeded, the whole procedure terminates
+                if(scs)
+                    if(curMetric==1)
+                        iterm1 = iterm1 +1;
+                    end
+                    if(curMetric==3)
+                        iterm3 = iterm3 +1;
+                    end
+                    break;
+                else
+                    continue;
+                end
+            end
+            
+            % prepend best_swaps
+            swaps = [best_swaps,base_swaps];
+            bstw = width(best_swaps);
+            bssw = width(swaps);
+            perm_flag = true;
+            
+            for idx = 1:bssw
+              
+                % if best_swaps exhausted:
+                if(idx > bstw && perm_flag)
+                       
+                    % base_swaps randomization
+                    perm_flag = false;
+                    pm = randperm(basw);
+                    base_swaps = base_swaps(:,pm);
+                    swaps = [best_swaps,base_swaps];
+                                    
+                    best_swaps_exhausted_flag = best_swaps_exhausted_flag - 1;
+                    
+                    % if the current metric is 1, apply a small
+                    % perturbation (each perturbate_every times)
+                    if(curMetric == 1 && best_swaps_exhausted_flag == 0)
+                        best_swaps_exhausted_flag = app.perturbate_every;
+                        
+                        cur_perm = app.k_vec_shuffle(cur_perm, round(0.45*app.dimA));
+                        best_A = best_A(cur_perm, cur_perm);
+                        [pmt, timeG] = app.kron_grouping(best_A);
+                        best_A = best_A(pmt, pmt);
+                        app.totalTimeGrouping = app.totalTimeGrouping + timeG;
+                        timeGrouping_m1 = timeGrouping_m1 + timeG;
+                        max_val = app.metric1(best_A, app.dimB, app.dimC);
+                        app.block_matrix = false;
+                        app.cornerized_matrix = false;
+                        
+                        if(app.debug_mode)
+                            htmlContent = strcat("<b>PARTIAL RESHUFFLE:</b><br/><br/>Scope: best swaps exhausted<br/>Current metric: ", num2str(curMetric));
+                            app.statsContentHtml.HTMLSource = htmlContent;
+                        end
+                        
+                    end
+                    % if the current metric is 3, swap to 1
+                    if(curMetric == 3)
+                        curMetric = 1;
+                        max_val = app.metric1(best_A, app.dimB, app.dimC);
+                        break_metric3 = false;
+                    end
+                    
+                    if(app.showStepsCkb.Value)
+                        set(app.imHandle, 'CData', best_A);
+                        drawnow
+                    end
+                    
+                end
+                
+              p = swaps(:,idx);
+              %% if best_swaps are not computed at each iteration, remove the current swap
+              if(app.best_count>1 && bstw>0)
+                  best_swaps(:,1) = [];
+              end
+              cur_perm = 1:app.dimA;
+              best_perm = cur_perm;
+              % in cur_perm switch elements indexed by p(1) and p(2)
+              cur_perm(p) = cur_perm(flip(p));
+              test_A = best_A(cur_perm, cur_perm);
+              %% evaluate the current metric after the swap
+              if(curMetric == 1)
+                  val = app.metric1(test_A, app.dimB, app.dimC);
+              end
+              if(curMetric == 3)
+                  val = app.metric3(test_A, app.dimB, app.dimC);
+              end
+              
+              if (val > max_val)
+                best_perm = cur_perm;
+                max_val = val;
+                improved = true;
+                % check if metric3 needs to be changet to 1
+                if(curMetric == 3 && (val>k*avgSum))
+                    break_metric3 = true;
+                end
+                break; %% stop after the first "good" result
+              end
+            end
+            elapsed = toc(totalTime);
+
+            if(curMetric == 1)
+                  elapsedm1 = elapsed - elapsedm3;
+            end
+            if(curMetric == 3)
+                  elapsedm3 = elapsed - elapsedm1;
+            end
+        
+            
+            %% Check the solution found so far
+            best_A = best_A(best_perm, best_perm);
+            [B, C, errMatrix] = app.NearestKroneckerProduct(best_A, [app.dimB app.dimB], [app.dimC app.dimC], hermitian);
+            best_err = app.kron_error(best_A, B, C);
+            errors(iter) = best_err;
+            best_frobErr = norm(errMatrix, 'fro');
+            frobErrors(iter) = best_frobErr;
+            
+            if(app.showStepsCkb.Value)
+                set(app.imHandle, 'CData', best_A);
+                drawnow
+            end
+            
+            if(curMetric == 1)
+                val_m1(iter) = max_val;
+                iterm1 = iterm1 +1;
+            end
+            if(curMetric == 3)
+                val_m3(iter) = max_val;
+                iterm3 = iterm3 +1;
+            end
+
+            if(curMetric == 3 && break_metric3)
+                curMetric = 1;
+                max_val = app.metric1(best_A, app.dimB, app.dimC);
+                val_m1(iter) = max_val;
+                break_metric3 = false;
+            end
+            
+            %% if each swap was tested without improvements, swap metric
+            %% each perturbate_every iterations that ended without improvements
+            %% apply a total perturbation
+    
+            if (~improved)
+              nrestarts = nrestarts + 1;
+              if ( mod(nrestarts, app.perturbate_every) == 0 )
+                % total reshuffle
+                if(app.debug_mode)
+                    htmlContent = strcat("<b>TOTAL RESHUFFLE:</b><br/><br/>Scope: Not improved, swap metric<br/>Current metric: ", num2str(curMetric));
+                    app.statsContentHtml.HTMLSource = htmlContent;
+                end
+                
+                best_perm = randperm(app.dimA);
+                best_A = best_A(best_perm,best_perm);
+                [pmt, timeG] = app.kron_grouping(best_A);
+                best_A = best_A(pmt, pmt);
+                curMetric = 3;
+                app.block_matrix = false;
+                app.cornerized_matrix = false;
+                best_frobErr = inf;
+                max_val = -inf;
+              else
+                % swap metric
+                if(curMetric == 1)
+                    curMetric = 3;
+                    max_val = app.metric3(best_A, app.dimB, app.dimC);
+                    val_m3(iter) = max_val;
+                elseif(curMetric == 3)
+                    curMetric = 1;
+                    max_val = app.metric1(best_A, app.dimB, app.dimC);
+                    val_m1(iter) = max_val;
+                end
+              end
+            end
+            
+            %% if the maximum number of total reshuffle is reached or
+            %% if the error is near zero, the whole procedure terminates
+            if (nrestarts >= (app.maxrestarts*app.perturbate_every) || best_frobErr < 1e-6)
+                break;
+            end
+          end
+          
+          elapsed = toc(totalTime);
+          if(curMetric == 1)
+                elapsedm1 = elapsed - elapsedm3;
+          end
+          if(curMetric == 3)
+                elapsedm3 = elapsed - elapsedm1;
+          end
+          
+          elapsedm1 = elapsedm1 - timeOnion_m1 - timeOutsiders_m1 - timeGrouping_m1;
+          elapsedm3 = elapsedm3 - timeOnion_m3 - timeOutsiders_m3 - timeGrouping_m3;
+          elapsedOutsiders = timeOutsiders_m1 + timeOutsiders_m3;
+          timeOnion = timeOnion_m1 + timeOnion_m3;
+          
+          success = (best_frobErr < 1e-6);
+        end
+
+    end
+    
+    
+
+    % Callbacks that handle component events
+    methods (Access = private)
+
+        % Code that executes after component creation
+        function kron_OpeningFcn(app, varargin)
+            % Create GUIDE-style callback args - Added by Migration Tool
+            [hObject, eventdata, handles] = convertToGUIDECallbackArguments(app); %#ok<ASGLU>
+            
+            % This function has no output args, see OutputFcn.
+            % hObject    handle to figure
+            % eventdata  reserved - to be defined in a future version of MATLAB
+            % handles    structure with handles and user data (see GUIDATA)
+            % varargin   command line arguments to kron (see VARARGIN)
+            
+            % Choose default command line output for kron
+            handles.output = hObject;
+            
+            % Update handles structure
+            guidata(hObject, handles);
+            
+            app.statsContentHtml.HTMLSource = "<br>";
+        end
+
+        % Button pushed function: generateButton
+        function generateButtonPushed(app, event)
+            colormap(app.figure1,gray(256));
+            app.dimB = app.dimBNum.Value;
+            app.dimC = app.dimCNum.Value;
+            app.denB = app.densityB.Value;
+            app.denC = app.densityC.Value;
+            app.dimA = app.dimB*app.dimC;
+            
+            app.maxiter_onion = 15*app.dimC;
+            
+            % if nonbipartite option is checked, generate matrices until a
+            % nonbipartite graph is produced
+            if(app.bipartiteCkb.Value)
+                while (true)
+                    % if nonconnected option is checked produce B with
+                    %  the specified number of connected components (disjoint union of graphs)
+                    if(app.connectedCkb.Value)
+                        B = app.disjoint_union(app.dimB,app.numComponents.Value);
+                    else
+                        B = randsrc(app.dimB,app.dimB,[0 1 ; 1-app.denB app.denB]);
+                    end
+                    C = randsrc(app.dimC,app.dimC,[0 1 ; 1-app.denC app.denC]);
+                    app.A = kron(B, C);
+                    if(~app.is_bipartite(app.A))
+                        break
+                    end
+                end
+            else
+                % if nonconnected option is checked produce B with
+                %  the specified number of connected components (disjoint union of graphs)
+                if(app.connectedCkb.Value)
+                    B = app.disjoint_union(app.dimB,app.numComponents.Value);
+                else
+                    B = randsrc(app.dimB,app.dimB,[0 1 ; 1-app.denB app.denB]);
+                end
+                C = randsrc(app.dimC,app.dimC,[0 1 ; 1-app.denC app.denC]);
+                app.A = kron(B, C);
+            end
+            
+            print_matrix(app, app.BFigure, B, app.dimB, app.dimB, "B");
+            print_matrix(app, app.CFigure, C, app.dimC, app.dimC, "C");
+            print_matrix(app, app.AFigure, app.A, app.dimA, app.dimC, "A");
+            app.imHandle = print_matrix(app, app.mainFigure, app.A, app.dimA, app.dimC, "Local search");
+            
+            cla(app.myAFigure);
+            cla(app.myBFigure);
+            cla(app.myCFigure);
+            title(app.myAFigure, "");
+            title(app.myBFigure, "");
+            title(app.myCFigure, "");
+            set(app.myAFigure, 'XGrid', 'off', 'YGrid', 'off', 'Xtick', [], 'Ytick', []);
+            cla(app.metric1Figure);
+            cla(app.metric3Figure);
+            cla(app.frobeniusErrorFigure);
+            cla(app.errorFigure);
+            plot(app.metric1Figure,(0));
+            plot(app.metric3Figure,(0));
+            plot(app.frobeniusErrorFigure,(0));
+            plot(app.errorFigure,(0));
+            app.statsContentHtml.HTMLSource = "<br/>";
+            
+            set(app.solveButton, 'Enable', true);
+            
+        end
+
+        % Button pushed function: solveButton
+        function solveButtonPushed(app, event)
+            set(app.solveButton, 'Enable', false);
+            set(app.generateButton, 'Enable', false);
+            
+            app.totalTimeGrouping = 0;
+            
+            %% first total randomization
+            p = randperm(app.dimA);
+            myA = app.A(p, p);
+            set(app.imHandle, 'CData', myA);
+            drawnow
+            pause(1);
+            
+            %% apply a first kron_grouping before calling alternateLocalSearch
+            [perm, timeG] = app.kron_grouping(myA);
+            myA = myA(perm, perm);
+            app.totalTimeGrouping = app.totalTimeGrouping + timeG;
+            
+            if(app.showStepsCkb.Value)
+                set(app.imHandle, 'CData', myA);
+                drawnow
+            end
+            
+            %% alternate local search
+            [success, myA, myB, myC, err, frobErr, val_m1, val_m3, iter, iterm1, iterm3, elapsed, elapsedm1, elapsedm3, elapsedOutsiders, timeOnion] = app.alternateLocalSearch(myA);
+            
+            if(success)
+                %% print solved matrices (if any)
+                print_matrix(app, app.myBFigure, myB, app.dimB, app.dimB, "solvedB");
+                print_matrix(app, app.myCFigure, myC, app.dimC, app.dimC, "solvedC");
+                print_matrix(app, app.myAFigure, myA, app.dimA, app.dimC, "solvedA");
+            end
+            
+            print_matrix(app, app.mainFigure, myA, app.dimA, app.dimC, "Local search");
+            
+            %% set plots (metrics, errors)
+            
+            plot(app.metric1Figure, val_m1);
+            title(app.metric1Figure, "Metrics progress");
+            ylabel(app.metric1Figure, "Metric 1");
+            set(app.metric1Figure, 'XTick', (1:floor(iter/10):iter+1), 'XLim', [1 iter+1],'LineWidth',2)
+            plot(app.metric3Figure, val_m3);
+            ylabel(app.metric3Figure, "Metric 3");
+            xlabel(app.metric3Figure, "Iterations");
+            set(app.metric3Figure, 'XTick', (1:floor(iter/10):iter+1), 'XLim', [1 iter+1],'LineWidth',2)
+            
+            plot(app.frobeniusErrorFigure, frobErr);
+            title(app.frobeniusErrorFigure, "Error progress");
+            ylabel(app.frobeniusErrorFigure, "Frobenius error");
+            set(app.frobeniusErrorFigure, 'XTick', (1:floor(iter/10):iter+1), 'XLim', [1 iter+1],'LineWidth',2)
+            plot(app.errorFigure, err);
+            ylabel(app.errorFigure, "Error %");
+            xlabel(app.errorFigure, "Iterations");
+            set(app.errorFigure, 'XTick', (1:floor(iter/10):iter+1), 'XLim', [1 iter+1],'LineWidth',2)
+            
+            %% set stats content
+            htmlContent = strcat("<b>Matrix elements: ", num2str(app.dimA*app.dimA), "<br/><br/>Iterations: ", num2str(iter), "</b><br/>&emsp;Iterations M1: ", num2str(iterm1), "<br/>&emsp;Iterations M3: ", num2str(iterm3), "<br/><br/><b>Total time: ", num2str(elapsed+timeG), "</b><br/>&emsp;Time M1: ", num2str(elapsedm1), "<br/>&emsp;Time M3: ", num2str(elapsedm3), "<br/>&emsp;Time grouping: ", num2str(app.totalTimeGrouping), "<br/>&emsp;Time outsiders: ", num2str(elapsedOutsiders), "<br/>&emsp;Time onion: ", num2str(timeOnion));
+            app.statsContentHtml.HTMLSource = htmlContent;
+            
+            set(app.generateButton, 'Enable', true);
+        end
+
+        % Button pushed function: solveBatchButton
+        function solveBatchButtonPushed(app, event)
+            set(app.solveBatchButton, 'Enable', false);
+            set(app.solveButton, 'Enable', false);
+            set(app.generateButton, 'Enable', false);
+            app.showStepsCkb.Value = false;
+            set(app.showStepsCkb, 'Enable', false);
+            
+            app.dimB = app.dimBNum.Value;
+            app.dimC = app.dimCNum.Value;
+            app.denB = app.densityB.Value;
+            app.denC = app.densityC.Value;
+            app.dimA = app.dimB*app.dimC;
+            
+            app.numProb = app.numProblems.Value;
+            app.numVars = app.numVariations.Value;
+            
+            app.maxiter_onion = 15*app.dimC;
+            
+            htmlContent = strcat("<b>Solving ", num2str(app.numProb*app.numVars), " problems...");
+            app.statsContentHtml.HTMLSource = htmlContent;
+            
+            drawnow
+            
+            nEdges = 0;
+            nSucc = 0;
+            totTime = 0;
+            totTimeFailed = 0;
+            totTimeSuccess = 0;
+            bestTime = inf;
+            bestAvgTime = inf;
+            bestTimes = ones(1,app.numProb)*inf;
+            worstTime = -1;
+            t = datetime('now');
+            DateString = datestr(t,'dd-mm-yyyy-HH-MM-SS');
+            path = strcat('batch-res-',DateString,'.txt');
+            path = path(~isspace(path));
+            fileID = fopen(path,'w');
+            
+            fprintf(fileID, 'Problems dimensions:\n');
+            fprintf(fileID, 'B: %d x %d C: %d x %d A: %d x %d\n', app.dimB,app.dimB,app.dimC,app.dimC,app.dimA,app.dimA);
+            fprintf(fileID, 'density B: %.2f density C: %.2f\n', app.denB, app.denC);
+            fprintf(fileID, 'Graph options: ');
+            if(app.bipartiteCkb.Value)
+                fprintf(fileID, 'NOT BIPARTITE ');
+            end
+            if(app.connectedCkb.Value)
+                fprintf(fileID, 'NOT CONNECTED (%d connected components)', app.numComponents.Value);
+            end
+            fprintf(fileID, '\n');
+            fprintf(fileID, 'number of problems: %d variations per problem: %d\n\n', app.numProb, app.numVars);
+            
+            
+            % generate numProb distinct problems (each one has dimension
+            % dimB*dimC=dimA)
+            for i=1:app.numProb
+                % if nonbipartite option is checked, generate matrices until a
+                % nonbipartite graph is produced
+                if(app.bipartiteCkb.Value)
+                    while (true)
+                        % if nonconnected option is checked produce B with
+                        % the specified number of connected components (disjoint union of graphs)
+                        if(app.connectedCkb.Value)
+                            B = app.disjoint_union(app.dimB,app.numComponents.Value);
+                        else
+                            B = randsrc(app.dimB,app.dimB,[0 1 ; 1-app.denB app.denB]);
+                        end
+                        C = randsrc(app.dimC,app.dimC,[0 1 ; 1-app.denC app.denC]);
+                        app.A = kron(B, C);
+                        if(~app.is_bipartite(app.A))
+                            break
+                        end
+                    end
+                else
+                    % if nonconnected option is checked produce B with
+                    % the specified number of connected components (disjoint union of graphs)
+                    if(app.connectedCkb.Value)
+                        B = app.disjoint_union(app.dimB,app.numComponents.Value);
+                    else
+                        B = randsrc(app.dimB,app.dimB,[0 1 ; 1-app.denB app.denB]);
+                    end
+                    C = randsrc(app.dimC,app.dimC,[0 1 ; 1-app.denC app.denC]);
+                    app.A = kron(B, C);
+                end
+                nEdges = sum(app.A,'all');
+                % generate numVars random permutations (variations) of the
+                % current problem
+                for j=1:app.numVars
+                    app.totalTimeGrouping = 0;
+                    p = randperm(app.dimA);
+                    myA = app.A(p, p);
+                    [perm, timeG] = app.kron_grouping(myA);
+                    myA = myA(perm, perm);
+                    app.totalTimeGrouping = app.totalTimeGrouping + timeG;
+                    
+                    htmlContent = strcat("<b>Solving problem ",num2str(app.numProb*(i-1)+j),"/",num2str(app.numProb*app.numVars));
+                    app.statsContentHtml.HTMLSource = htmlContent;
+                    drawnow
+                    
+                    %% alternate local search
+                    [success, ~, ~, ~, ~, ~, ~, ~, ~, ~, ~, elapsed, ~, ~, ~, ~] = app.alternateLocalSearch(myA);
+                    %% update stats
+                    totTime = totTime + elapsed + timeG;
+                    if(success)
+                        if((elapsed+timeG)>worstTime)
+                            worstTime = elapsed + timeG;
+                        end
+                        if((elapsed+timeG)<bestTimes(i))
+                            bestTimes(i) = elapsed + timeG;
+                        end
+                        nSucc = nSucc + 1;
+                        totTimeSuccess = totTimeSuccess + elapsed + timeG;
+                        fprintf(fileID, '[problem %d %d] - edges: %d (%.2f%%), solved: YES, time elapsed: %.2f\n', i, j, nEdges, nEdges/(app.dimA*app.dimA), elapsed+timeG);
+                    else
+                        totTimeFailed = totTimeFailed + elapsed + timeG;
+                        fprintf(fileID, '[problem %d %d] - edges: %d (%.2f%%), solved: NO, time elapsed: %.2f\n', i, j, nEdges, nEdges/(app.dimA*app.dimA), elapsed+timeG);
+                    end
+                end
+            end
+            
+            bestTime = min(bestTimes);
+            bestAvgTime = mean(bestTimes(isfinite(bestTimes)));
+            
+            fprintf(fileID, '\nStats:\n');
+            fprintf(fileID, 'number of successes: %d / %d\n', nSucc, (app.numProb*app.numVars));
+            fprintf(fileID, 'total time: %.2f sec\naverage time: %.2f sec\n', totTime, totTime/(app.numProb*app.numVars));
+            fprintf(fileID, 'average time succeeded: %.2f sec\naverage time of best solutions: %.2f sec\nbest time: %.2f sec\nworst time: %.2f sec\n\n', totTimeSuccess/nSucc, bestAvgTime, bestTime, worstTime);
+            fclose(fileID);
+            
+            htmlContent = strcat("<b>Solved problems: ", num2str(nSucc), "/", num2str(app.numProb*app.numVars), "</b><br/><br/><b>Average time: ", num2str(totTime/(app.numProb*app.numVars)), "</b><br/><br/>Output file:<br/>", pwd(), path);
+            app.statsContentHtml.HTMLSource = htmlContent;
+            
+            set(app.generateButton, 'Enable', true);
+            set(app.solveBatchButton, 'Enable', true);
+            set(app.showStepsCkb, 'Enable', true);
+        end
+
+        % Value changed function: connectedCkb
+        function connectedCkbValueChanged(app, event)
+            if(app.connectedCkb.Value)
+                set(app.numComponents, 'Enable', true);
+            else
+                set(app.numComponents, 'Enable', false);
+            end
+            
+        end
+
+        % Value changed function: numComponents
+        function numComponentsValueChanged(app, event)
+            
+            if(app.numComponents.Value > app.dimBNum.Value)
+               app.numComponents.Value = app.dimBNum.Value;
+            end
+            
+        end
+    end
+
+    % Component initialization
+    methods (Access = private)
+
+        % Create UIFigure and components
+        function createComponents(app)
+
+            % Create figure1 and hide until all components are created
+            app.figure1 = uifigure('Visible', 'off');
+            app.figure1.Colormap = [0.2824 0.3294 0.9647;0.2784 0.3373 0.9686;0.2784 0.3412 0.9686;0.2784 0.349 0.9725;0.2784 0.3529 0.9765;0.2784 0.3569 0.9804;0.2784 0.3647 0.9804;0.2745 0.3686 0.9843;0.2745 0.3765 0.9843;0.2745 0.3804 0.9882;0.2706 0.3843 0.9882;0.2706 0.3922 0.9922;0.2667 0.3961 0.9922;0.2627 0.4039 0.9922;0.2627 0.4078 0.9961;0.2588 0.4157 0.9961;0.2549 0.4196 0.9961;0.251 0.4275 0.9961;0.2471 0.4314 1;0.2431 0.4392 1;0.2353 0.4431 1;0.2314 0.451 1;0.2235 0.4549 1;0.2196 0.4627 0.9961;0.2118 0.4667 0.9961;0.2078 0.4745 0.9922;0.2 0.4784 0.9922;0.1961 0.4863 0.9882;0.1922 0.4902 0.9882;0.1882 0.498 0.9843;0.1843 0.502 0.9804;0.1843 0.5098 0.9804;0.1804 0.5137 0.9765;0.1804 0.5176 0.9725;0.1804 0.5255 0.9725;0.1804 0.5294 0.9686;0.1765 0.5333 0.9647;0.1765 0.5412 0.9608;0.1765 0.5451 0.9569;0.1765 0.549 0.9529;0.1765 0.5569 0.949;0.1725 0.5608 0.9451;0.1725 0.5647 0.9412;0.1686 0.5686 0.9373;0.1647 0.5765 0.9333;0.1608 0.5804 0.9294;0.1569 0.5843 0.9255;0.1529 0.5922 0.9216;0.1529 0.5961 0.9176;0.149 0.6 0.9137;0.149 0.6039 0.9098;0.1451 0.6078 0.9098;0.1451 0.6118 0.9059;0.1412 0.6196 0.902;0.1412 0.6235 0.898;0.1373 0.6275 0.898;0.1373 0.6314 0.8941;0.1333 0.6353 0.8941;0.1294 0.6392 0.8902;0.1255 0.6471 0.8902;0.1216 0.651 0.8863;0.1176 0.6549 0.8824;0.1137 0.6588 0.8824;0.1137 0.6627 0.8784;0.1098 0.6667 0.8745;0.1059 0.6706 0.8706;0.102 0.6745 0.8667;0.098 0.6784 0.8627;0.0902 0.6824 0.8549;0.0863 0.6863 0.851;0.0784 0.6902 0.8471;0.0706 0.6941 0.8392;0.0627 0.698 0.8353;0.0549 0.702 0.8314;0.0431 0.702 0.8235;0.0314 0.7059 0.8196;0.0235 0.7098 0.8118;0.0157 0.7137 0.8078;0.0078 0.7176 0.8;0.0039 0.7176 0.7922;0 0.7216 0.7882;0 0.7255 0.7804;0 0.7294 0.7765;0.0039 0.7294 0.7686;0.0078 0.7333 0.7608;0.0157 0.7333 0.7569;0.0235 0.7373 0.749;0.0353 0.7412 0.7412;0.051 0.7412 0.7373;0.0627 0.7451 0.7294;0.0784 0.7451 0.7216;0.0902 0.749 0.7137;0.102 0.7529 0.7098;0.1137 0.7529 0.702;0.1255 0.7569 0.6941;0.1373 0.7569 0.6863;0.1451 0.7608 0.6824;0.1529 0.7608 0.6745;0.1608 0.7647 0.6667;0.1686 0.7647 0.6588;0.1725 0.7686 0.651;0.1804 0.7686 0.6471;0.1843 0.7725 0.6392;0.1922 0.7725 0.6314;0.1961 0.7765 0.6235;0.2 0.7804 0.6157;0.2078 0.7804 0.6078;0.2118 0.7843 0.6;0.2196 0.7843 0.5882;0.2235 0.7882 0.5804;0.2314 0.7882 0.5725;0.2392 0.7922 0.5647;0.251 0.7922 0.5529;0.2588 0.7922 0.5451;0.2706 0.7961 0.5373;0.2824 0.7961 0.5255;0.2941 0.7961 0.5176;0.3059 0.8 0.5059;0.3176 0.8 0.498;0.3294 0.8 0.4863;0.3412 0.8 0.4784;0.3529 0.8 0.4667;0.3686 0.8039 0.4549;0.3804 0.8039 0.4471;0.3922 0.8039 0.4353;0.4039 0.8039 0.4235;0.4196 0.8039 0.4118;0.4314 0.8039 0.4;0.4471 0.8039 0.3922;0.4627 0.8 0.3804;0.4745 0.8 0.3686;0.4902 0.8 0.3569;0.5059 0.8 0.349;0.5176 0.8 0.3373;0.5333 0.7961 0.3255;0.5451 0.7961 0.3176;0.5608 0.7961 0.3059;0.5765 0.7922 0.2941;0.5882 0.7922 0.2824;0.6039 0.7882 0.2745;0.6157 0.7882 0.2627;0.6314 0.7843 0.251;0.6431 0.7843 0.2431;0.6549 0.7804 0.2314;0.6706 0.7804 0.2235;0.6824 0.7765 0.2157;0.698 0.7765 0.2078;0.7098 0.7725 0.2;0.7216 0.7686 0.1922;0.7333 0.7686 0.1843;0.7451 0.7647 0.1765;0.7608 0.7647 0.1725;0.7725 0.7608 0.1647;0.7843 0.7569 0.1608;0.7961 0.7569 0.1569;0.8078 0.7529 0.1529;0.8157 0.749 0.1529;0.8275 0.749 0.1529;0.8392 0.7451 0.1529;0.851 0.7451 0.1569;0.8588 0.7412 0.1569;0.8706 0.7373 0.1608;0.8824 0.7373 0.1647;0.8902 0.7373 0.1686;0.902 0.7333 0.1765;0.9098 0.7333 0.1804;0.9176 0.7294 0.1882;0.9255 0.7294 0.1961;0.9373 0.7294 0.2078;0.9451 0.7294 0.2157;0.9529 0.7294 0.2235;0.9608 0.7294 0.2314;0.9686 0.7294 0.2392;0.9765 0.7294 0.2431;0.9843 0.7333 0.2431;0.9882 0.7373 0.2431;0.9961 0.7412 0.2392;0.9961 0.7451 0.2353;0.9961 0.7529 0.2314;0.9961 0.7569 0.2275;0.9961 0.7608 0.2235;0.9961 0.7686 0.2196;0.9961 0.7725 0.2157;0.9961 0.7804 0.2078;0.9961 0.7843 0.2039;0.9961 0.7922 0.2;0.9922 0.7961 0.1961;0.9922 0.8039 0.1922;0.9922 0.8078 0.1922;0.9882 0.8157 0.1882;0.9843 0.8235 0.1843;0.9843 0.8275 0.1804;0.9804 0.8353 0.1804;0.9765 0.8392 0.1765;0.9765 0.8471 0.1725;0.9725 0.851 0.1686;0.9686 0.8588 0.1647;0.9686 0.8667 0.1647;0.9647 0.8706 0.1608;0.9647 0.8784 0.1569;0.9608 0.8824 0.1569;0.9608 0.8902 0.1529;0.9608 0.898 0.149;0.9608 0.902 0.149;0.9608 0.9098 0.1451;0.9608 0.9137 0.1412;0.9608 0.9216 0.1373;0.9608 0.9255 0.1333;0.9608 0.9333 0.1294;0.9608 0.9412 0.1294;0.9608 0.949 0.1216;0.9608 0.949 0.1216;0.9686 0.9608 0.1098;0.9686 0.9608 0.1098;0.9686 0.9686 0.102;0 0 0;1 1 1;1 1 1];
+            app.figure1.Position = [0 -300 1130 1000];
+            app.figure1.Name = 'kron';
+            app.figure1.HandleVisibility = 'callback';
+            app.figure1.Tag = 'figure1';
+            app.figure1.Pointer = 'cross';
+
+            % Create kronFactorsPanel
+            app.kronFactorsPanel = uipanel(app.figure1);
+            app.kronFactorsPanel.Title = 'Kron factors';
+            app.kronFactorsPanel.Tag = 'kronFactorsPanel';
+            app.kronFactorsPanel.FontSize = 16;
+            app.kronFactorsPanel.Position = [19 845 220 140];
+
+            % Create Blabel
+            app.Blabel = uilabel(app.kronFactorsPanel);
+            app.Blabel.Tag = 'Blabel';
+            app.Blabel.HorizontalAlignment = 'center';
+            app.Blabel.VerticalAlignment = 'top';
+            app.Blabel.WordWrap = 'on';
+            app.Blabel.FontSize = 13;
+            app.Blabel.FontWeight = 'bold';
+            app.Blabel.Position = [93 76 40 22];
+            app.Blabel.Text = 'B';
+
+            % Create Clabel
+            app.Clabel = uilabel(app.kronFactorsPanel);
+            app.Clabel.Tag = 'Clabel';
+            app.Clabel.HorizontalAlignment = 'center';
+            app.Clabel.VerticalAlignment = 'top';
+            app.Clabel.WordWrap = 'on';
+            app.Clabel.FontSize = 13;
+            app.Clabel.FontWeight = 'bold';
+            app.Clabel.Position = [154 76 40 22];
+            app.Clabel.Text = 'C';
+
+            % Create DensityLabel
+            app.DensityLabel = uilabel(app.kronFactorsPanel);
+            app.DensityLabel.HorizontalAlignment = 'right';
+            app.DensityLabel.Position = [11 13 46 22];
+            app.DensityLabel.Text = 'Density';
+
+            % Create densityB
+            app.densityB = uispinner(app.kronFactorsPanel);
+            app.densityB.Step = 0.1;
+            app.densityB.Limits = [0.1 0.9];
+            app.densityB.Tag = 'densityB';
+            app.densityB.Position = [89 13 51 22];
+            app.densityB.Value = 0.5;
+
+            % Create densityC
+            app.densityC = uispinner(app.kronFactorsPanel);
+            app.densityC.Step = 0.1;
+            app.densityC.Limits = [0.1 0.9];
+            app.densityC.Tag = 'densityC';
+            app.densityC.Position = [150 13 51 22];
+            app.densityC.Value = 0.5;
+
+            % Create DimensionEditFieldLabel
+            app.DimensionEditFieldLabel = uilabel(app.kronFactorsPanel);
+            app.DimensionEditFieldLabel.HorizontalAlignment = 'right';
+            app.DimensionEditFieldLabel.Position = [12 46 62 22];
+            app.DimensionEditFieldLabel.Text = 'Dimension';
+
+            % Create dimBNum
+            app.dimBNum = uieditfield(app.kronFactorsPanel, 'numeric');
+            app.dimBNum.Limits = [2 20];
+            app.dimBNum.Tag = 'dimBNum';
+            app.dimBNum.Position = [89 46 47 22];
+            app.dimBNum.Value = 5;
+
+            % Create dimCNum
+            app.dimCNum = uieditfield(app.kronFactorsPanel, 'numeric');
+            app.dimCNum.Limits = [2 100];
+            app.dimCNum.Tag = 'dimCNum';
+            app.dimCNum.Position = [150 46 47 22];
+            app.dimCNum.Value = 5;
+
+            % Create statsPanel
+            app.statsPanel = uipanel(app.figure1);
+            app.statsPanel.Title = 'Stats';
+            app.statsPanel.Tag = 'statsPanel';
+            app.statsPanel.FontSize = 16;
+            app.statsPanel.Position = [845 11 265 407];
+
+            % Create statsContentHtml
+            app.statsContentHtml = uihtml(app.statsPanel);
+            app.statsContentHtml.Tag = 'statsContentHtml';
+            app.statsContentHtml.Position = [12 6 240 368];
+
+            % Create solvePanel
+            app.solvePanel = uipanel(app.figure1);
+            app.solvePanel.Title = 'Solve problem';
+            app.solvePanel.Tag = 'solvePanel';
+            app.solvePanel.FontSize = 16;
+            app.solvePanel.Position = [577 845 159 140];
+
+            % Create generateButton
+            app.generateButton = uibutton(app.solvePanel, 'push');
+            app.generateButton.ButtonPushedFcn = createCallbackFcn(app, @generateButtonPushed, true);
+            app.generateButton.Tag = 'generateButton';
+            app.generateButton.FontSize = 13;
+            app.generateButton.Position = [35 76 90 30];
+            app.generateButton.Text = 'Generate';
+
+            % Create showStepsCkb
+            app.showStepsCkb = uicheckbox(app.solvePanel);
+            app.showStepsCkb.Tag = 'showStepsCkb';
+            app.showStepsCkb.Text = 'Show steps';
+            app.showStepsCkb.Position = [41 46 84 22];
+
+            % Create solveButton
+            app.solveButton = uibutton(app.solvePanel, 'push');
+            app.solveButton.ButtonPushedFcn = createCallbackFcn(app, @solveButtonPushed, true);
+            app.solveButton.Tag = 'solveButton';
+            app.solveButton.FontSize = 13;
+            app.solveButton.Enable = 'off';
+            app.solveButton.Position = [35 9 90 30];
+            app.solveButton.Text = 'Solve';
+
+            % Create solveBatchPanel
+            app.solveBatchPanel = uipanel(app.figure1);
+            app.solveBatchPanel.Title = 'Solve problem (batch)';
+            app.solveBatchPanel.Tag = 'solveBatchPanel';
+            app.solveBatchPanel.FontSize = 16;
+            app.solveBatchPanel.Position = [754 845 244 140];
+
+            % Create NumberofproblemsLabel
+            app.NumberofproblemsLabel = uilabel(app.solveBatchPanel);
+            app.NumberofproblemsLabel.HorizontalAlignment = 'right';
+            app.NumberofproblemsLabel.Position = [18 80 115 22];
+            app.NumberofproblemsLabel.Text = 'Number of problems';
+
+            % Create numProblems
+            app.numProblems = uieditfield(app.solveBatchPanel, 'numeric');
+            app.numProblems.Limits = [2 100];
+            app.numProblems.Tag = 'numProblems';
+            app.numProblems.Position = [178 80 44 22];
+            app.numProblems.Value = 10;
+
+            % Create VariationsperproblemLabel
+            app.VariationsperproblemLabel = uilabel(app.solveBatchPanel);
+            app.VariationsperproblemLabel.HorizontalAlignment = 'right';
+            app.VariationsperproblemLabel.Position = [19 50 125 22];
+            app.VariationsperproblemLabel.Text = 'Variations per problem';
+
+            % Create numVariations
+            app.numVariations = uieditfield(app.solveBatchPanel, 'numeric');
+            app.numVariations.Limits = [2 100];
+            app.numVariations.Tag = 'numVariations';
+            app.numVariations.Position = [178 50 44 22];
+            app.numVariations.Value = 10;
+
+            % Create solveBatchButton
+            app.solveBatchButton = uibutton(app.solveBatchPanel, 'push');
+            app.solveBatchButton.ButtonPushedFcn = createCallbackFcn(app, @solveBatchButtonPushed, true);
+            app.solveBatchButton.Tag = 'solveBatchButton';
+            app.solveBatchButton.FontSize = 13;
+            app.solveBatchButton.Position = [77 9 90 30];
+            app.solveBatchButton.Text = 'Launch';
+
+            % Create graphPanel
+            app.graphPanel = uipanel(app.figure1);
+            app.graphPanel.Title = 'Graph options';
+            app.graphPanel.Tag = 'graphPanel';
+            app.graphPanel.FontSize = 16;
+            app.graphPanel.Position = [262 845 292 140];
+
+            % Create bipartiteCkb
+            app.bipartiteCkb = uicheckbox(app.graphPanel);
+            app.bipartiteCkb.Tag = 'bipartiteCkb';
+            app.bipartiteCkb.Text = 'Not bipartite';
+            app.bipartiteCkb.Position = [17 80 87 22];
+
+            % Create connectedCkb
+            app.connectedCkb = uicheckbox(app.graphPanel);
+            app.connectedCkb.ValueChangedFcn = createCallbackFcn(app, @connectedCkbValueChanged, true);
+            app.connectedCkb.Tag = 'connectedCkb';
+            app.connectedCkb.Text = 'Not connected';
+            app.connectedCkb.Position = [17 50 99 22];
+
+            % Create NumberofconnectedcomponentsLabel
+            app.NumberofconnectedcomponentsLabel = uilabel(app.graphPanel);
+            app.NumberofconnectedcomponentsLabel.HorizontalAlignment = 'right';
+            app.NumberofconnectedcomponentsLabel.Position = [12 17 190 22];
+            app.NumberofconnectedcomponentsLabel.Text = 'Number of connected components';
+
+            % Create numComponents
+            app.numComponents = uieditfield(app.graphPanel, 'numeric');
+            app.numComponents.Limits = [2 100];
+            app.numComponents.ValueChangedFcn = createCallbackFcn(app, @numComponentsValueChanged, true);
+            app.numComponents.Tag = 'numComponents';
+            app.numComponents.Enable = 'off';
+            app.numComponents.Position = [231 17 43 22];
+            app.numComponents.Value = 2;
+
+            % Create mainFigure
+            app.mainFigure = uiaxes(app.figure1);
+            app.mainFigure.Colormap = [0.2824 0.3294 0.9647;0.2784 0.3373 0.9686;0.2784 0.3412 0.9686;0.2784 0.349 0.9725;0.2784 0.3529 0.9765;0.2784 0.3569 0.9804;0.2784 0.3647 0.9804;0.2745 0.3686 0.9843;0.2745 0.3765 0.9843;0.2745 0.3804 0.9882;0.2706 0.3843 0.9882;0.2706 0.3922 0.9922;0.2667 0.3961 0.9922;0.2627 0.4039 0.9922;0.2627 0.4078 0.9961;0.2588 0.4157 0.9961;0.2549 0.4196 0.9961;0.251 0.4275 0.9961;0.2471 0.4314 1;0.2431 0.4392 1;0.2353 0.4431 1;0.2314 0.451 1;0.2235 0.4549 1;0.2196 0.4627 0.9961;0.2118 0.4667 0.9961;0.2078 0.4745 0.9922;0.2 0.4784 0.9922;0.1961 0.4863 0.9882;0.1922 0.4902 0.9882;0.1882 0.498 0.9843;0.1843 0.502 0.9804;0.1843 0.5098 0.9804;0.1804 0.5137 0.9765;0.1804 0.5176 0.9725;0.1804 0.5255 0.9725;0.1804 0.5294 0.9686;0.1765 0.5333 0.9647;0.1765 0.5412 0.9608;0.1765 0.5451 0.9569;0.1765 0.549 0.9529;0.1765 0.5569 0.949;0.1725 0.5608 0.9451;0.1725 0.5647 0.9412;0.1686 0.5686 0.9373;0.1647 0.5765 0.9333;0.1608 0.5804 0.9294;0.1569 0.5843 0.9255;0.1529 0.5922 0.9216;0.1529 0.5961 0.9176;0.149 0.6 0.9137;0.149 0.6039 0.9098;0.1451 0.6078 0.9098;0.1451 0.6118 0.9059;0.1412 0.6196 0.902;0.1412 0.6235 0.898;0.1373 0.6275 0.898;0.1373 0.6314 0.8941;0.1333 0.6353 0.8941;0.1294 0.6392 0.8902;0.1255 0.6471 0.8902;0.1216 0.651 0.8863;0.1176 0.6549 0.8824;0.1137 0.6588 0.8824;0.1137 0.6627 0.8784;0.1098 0.6667 0.8745;0.1059 0.6706 0.8706;0.102 0.6745 0.8667;0.098 0.6784 0.8627;0.0902 0.6824 0.8549;0.0863 0.6863 0.851;0.0784 0.6902 0.8471;0.0706 0.6941 0.8392;0.0627 0.698 0.8353;0.0549 0.702 0.8314;0.0431 0.702 0.8235;0.0314 0.7059 0.8196;0.0235 0.7098 0.8118;0.0157 0.7137 0.8078;0.0078 0.7176 0.8;0.0039 0.7176 0.7922;0 0.7216 0.7882;0 0.7255 0.7804;0 0.7294 0.7765;0.0039 0.7294 0.7686;0.0078 0.7333 0.7608;0.0157 0.7333 0.7569;0.0235 0.7373 0.749;0.0353 0.7412 0.7412;0.051 0.7412 0.7373;0.0627 0.7451 0.7294;0.0784 0.7451 0.7216;0.0902 0.749 0.7137;0.102 0.7529 0.7098;0.1137 0.7529 0.702;0.1255 0.7569 0.6941;0.1373 0.7569 0.6863;0.1451 0.7608 0.6824;0.1529 0.7608 0.6745;0.1608 0.7647 0.6667;0.1686 0.7647 0.6588;0.1725 0.7686 0.651;0.1804 0.7686 0.6471;0.1843 0.7725 0.6392;0.1922 0.7725 0.6314;0.1961 0.7765 0.6235;0.2 0.7804 0.6157;0.2078 0.7804 0.6078;0.2118 0.7843 0.6;0.2196 0.7843 0.5882;0.2235 0.7882 0.5804;0.2314 0.7882 0.5725;0.2392 0.7922 0.5647;0.251 0.7922 0.5529;0.2588 0.7922 0.5451;0.2706 0.7961 0.5373;0.2824 0.7961 0.5255;0.2941 0.7961 0.5176;0.3059 0.8 0.5059;0.3176 0.8 0.498;0.3294 0.8 0.4863;0.3412 0.8 0.4784;0.3529 0.8 0.4667;0.3686 0.8039 0.4549;0.3804 0.8039 0.4471;0.3922 0.8039 0.4353;0.4039 0.8039 0.4235;0.4196 0.8039 0.4118;0.4314 0.8039 0.4;0.4471 0.8039 0.3922;0.4627 0.8 0.3804;0.4745 0.8 0.3686;0.4902 0.8 0.3569;0.5059 0.8 0.349;0.5176 0.8 0.3373;0.5333 0.7961 0.3255;0.5451 0.7961 0.3176;0.5608 0.7961 0.3059;0.5765 0.7922 0.2941;0.5882 0.7922 0.2824;0.6039 0.7882 0.2745;0.6157 0.7882 0.2627;0.6314 0.7843 0.251;0.6431 0.7843 0.2431;0.6549 0.7804 0.2314;0.6706 0.7804 0.2235;0.6824 0.7765 0.2157;0.698 0.7765 0.2078;0.7098 0.7725 0.2;0.7216 0.7686 0.1922;0.7333 0.7686 0.1843;0.7451 0.7647 0.1765;0.7608 0.7647 0.1725;0.7725 0.7608 0.1647;0.7843 0.7569 0.1608;0.7961 0.7569 0.1569;0.8078 0.7529 0.1529;0.8157 0.749 0.1529;0.8275 0.749 0.1529;0.8392 0.7451 0.1529;0.851 0.7451 0.1569;0.8588 0.7412 0.1569;0.8706 0.7373 0.1608;0.8824 0.7373 0.1647;0.8902 0.7373 0.1686;0.902 0.7333 0.1765;0.9098 0.7333 0.1804;0.9176 0.7294 0.1882;0.9255 0.7294 0.1961;0.9373 0.7294 0.2078;0.9451 0.7294 0.2157;0.9529 0.7294 0.2235;0.9608 0.7294 0.2314;0.9686 0.7294 0.2392;0.9765 0.7294 0.2431;0.9843 0.7333 0.2431;0.9882 0.7373 0.2431;0.9961 0.7412 0.2392;0.9961 0.7451 0.2353;0.9961 0.7529 0.2314;0.9961 0.7569 0.2275;0.9961 0.7608 0.2235;0.9961 0.7686 0.2196;0.9961 0.7725 0.2157;0.9961 0.7804 0.2078;0.9961 0.7843 0.2039;0.9961 0.7922 0.2;0.9922 0.7961 0.1961;0.9922 0.8039 0.1922;0.9922 0.8078 0.1922;0.9882 0.8157 0.1882;0.9843 0.8235 0.1843;0.9843 0.8275 0.1804;0.9804 0.8353 0.1804;0.9765 0.8392 0.1765;0.9765 0.8471 0.1725;0.9725 0.851 0.1686;0.9686 0.8588 0.1647;0.9686 0.8667 0.1647;0.9647 0.8706 0.1608;0.9647 0.8784 0.1569;0.9608 0.8824 0.1569;0.9608 0.8902 0.1529;0.9608 0.898 0.149;0.9608 0.902 0.149;0.9608 0.9098 0.1451;0.9608 0.9137 0.1412;0.9608 0.9216 0.1373;0.9608 0.9255 0.1333;0.9608 0.9333 0.1294;0.9608 0.9412 0.1294;0.9608 0.949 0.1216;0.9608 0.949 0.1216;0.9686 0.9608 0.1098;0.9686 0.9608 0.1098;0.9686 0.9686 0.102;0 0 0;1 1 1;1 1 1];
+            app.mainFigure.XTick = [];
+            app.mainFigure.YTick = [];
+            app.mainFigure.FontSize = 13;
+            app.mainFigure.NextPlot = 'replace';
+            app.mainFigure.Tag = 'mainFigure';
+            app.mainFigure.Position = [706 428 412 412];
+
+            % Create BFigure
+            app.BFigure = uiaxes(app.figure1);
+            app.BFigure.Colormap = [0.2824 0.3294 0.9647;0.2784 0.3373 0.9686;0.2784 0.3412 0.9686;0.2784 0.349 0.9725;0.2784 0.3529 0.9765;0.2784 0.3569 0.9804;0.2784 0.3647 0.9804;0.2745 0.3686 0.9843;0.2745 0.3765 0.9843;0.2745 0.3804 0.9882;0.2706 0.3843 0.9882;0.2706 0.3922 0.9922;0.2667 0.3961 0.9922;0.2627 0.4039 0.9922;0.2627 0.4078 0.9961;0.2588 0.4157 0.9961;0.2549 0.4196 0.9961;0.251 0.4275 0.9961;0.2471 0.4314 1;0.2431 0.4392 1;0.2353 0.4431 1;0.2314 0.451 1;0.2235 0.4549 1;0.2196 0.4627 0.9961;0.2118 0.4667 0.9961;0.2078 0.4745 0.9922;0.2 0.4784 0.9922;0.1961 0.4863 0.9882;0.1922 0.4902 0.9882;0.1882 0.498 0.9843;0.1843 0.502 0.9804;0.1843 0.5098 0.9804;0.1804 0.5137 0.9765;0.1804 0.5176 0.9725;0.1804 0.5255 0.9725;0.1804 0.5294 0.9686;0.1765 0.5333 0.9647;0.1765 0.5412 0.9608;0.1765 0.5451 0.9569;0.1765 0.549 0.9529;0.1765 0.5569 0.949;0.1725 0.5608 0.9451;0.1725 0.5647 0.9412;0.1686 0.5686 0.9373;0.1647 0.5765 0.9333;0.1608 0.5804 0.9294;0.1569 0.5843 0.9255;0.1529 0.5922 0.9216;0.1529 0.5961 0.9176;0.149 0.6 0.9137;0.149 0.6039 0.9098;0.1451 0.6078 0.9098;0.1451 0.6118 0.9059;0.1412 0.6196 0.902;0.1412 0.6235 0.898;0.1373 0.6275 0.898;0.1373 0.6314 0.8941;0.1333 0.6353 0.8941;0.1294 0.6392 0.8902;0.1255 0.6471 0.8902;0.1216 0.651 0.8863;0.1176 0.6549 0.8824;0.1137 0.6588 0.8824;0.1137 0.6627 0.8784;0.1098 0.6667 0.8745;0.1059 0.6706 0.8706;0.102 0.6745 0.8667;0.098 0.6784 0.8627;0.0902 0.6824 0.8549;0.0863 0.6863 0.851;0.0784 0.6902 0.8471;0.0706 0.6941 0.8392;0.0627 0.698 0.8353;0.0549 0.702 0.8314;0.0431 0.702 0.8235;0.0314 0.7059 0.8196;0.0235 0.7098 0.8118;0.0157 0.7137 0.8078;0.0078 0.7176 0.8;0.0039 0.7176 0.7922;0 0.7216 0.7882;0 0.7255 0.7804;0 0.7294 0.7765;0.0039 0.7294 0.7686;0.0078 0.7333 0.7608;0.0157 0.7333 0.7569;0.0235 0.7373 0.749;0.0353 0.7412 0.7412;0.051 0.7412 0.7373;0.0627 0.7451 0.7294;0.0784 0.7451 0.7216;0.0902 0.749 0.7137;0.102 0.7529 0.7098;0.1137 0.7529 0.702;0.1255 0.7569 0.6941;0.1373 0.7569 0.6863;0.1451 0.7608 0.6824;0.1529 0.7608 0.6745;0.1608 0.7647 0.6667;0.1686 0.7647 0.6588;0.1725 0.7686 0.651;0.1804 0.7686 0.6471;0.1843 0.7725 0.6392;0.1922 0.7725 0.6314;0.1961 0.7765 0.6235;0.2 0.7804 0.6157;0.2078 0.7804 0.6078;0.2118 0.7843 0.6;0.2196 0.7843 0.5882;0.2235 0.7882 0.5804;0.2314 0.7882 0.5725;0.2392 0.7922 0.5647;0.251 0.7922 0.5529;0.2588 0.7922 0.5451;0.2706 0.7961 0.5373;0.2824 0.7961 0.5255;0.2941 0.7961 0.5176;0.3059 0.8 0.5059;0.3176 0.8 0.498;0.3294 0.8 0.4863;0.3412 0.8 0.4784;0.3529 0.8 0.4667;0.3686 0.8039 0.4549;0.3804 0.8039 0.4471;0.3922 0.8039 0.4353;0.4039 0.8039 0.4235;0.4196 0.8039 0.4118;0.4314 0.8039 0.4;0.4471 0.8039 0.3922;0.4627 0.8 0.3804;0.4745 0.8 0.3686;0.4902 0.8 0.3569;0.5059 0.8 0.349;0.5176 0.8 0.3373;0.5333 0.7961 0.3255;0.5451 0.7961 0.3176;0.5608 0.7961 0.3059;0.5765 0.7922 0.2941;0.5882 0.7922 0.2824;0.6039 0.7882 0.2745;0.6157 0.7882 0.2627;0.6314 0.7843 0.251;0.6431 0.7843 0.2431;0.6549 0.7804 0.2314;0.6706 0.7804 0.2235;0.6824 0.7765 0.2157;0.698 0.7765 0.2078;0.7098 0.7725 0.2;0.7216 0.7686 0.1922;0.7333 0.7686 0.1843;0.7451 0.7647 0.1765;0.7608 0.7647 0.1725;0.7725 0.7608 0.1647;0.7843 0.7569 0.1608;0.7961 0.7569 0.1569;0.8078 0.7529 0.1529;0.8157 0.749 0.1529;0.8275 0.749 0.1529;0.8392 0.7451 0.1529;0.851 0.7451 0.1569;0.8588 0.7412 0.1569;0.8706 0.7373 0.1608;0.8824 0.7373 0.1647;0.8902 0.7373 0.1686;0.902 0.7333 0.1765;0.9098 0.7333 0.1804;0.9176 0.7294 0.1882;0.9255 0.7294 0.1961;0.9373 0.7294 0.2078;0.9451 0.7294 0.2157;0.9529 0.7294 0.2235;0.9608 0.7294 0.2314;0.9686 0.7294 0.2392;0.9765 0.7294 0.2431;0.9843 0.7333 0.2431;0.9882 0.7373 0.2431;0.9961 0.7412 0.2392;0.9961 0.7451 0.2353;0.9961 0.7529 0.2314;0.9961 0.7569 0.2275;0.9961 0.7608 0.2235;0.9961 0.7686 0.2196;0.9961 0.7725 0.2157;0.9961 0.7804 0.2078;0.9961 0.7843 0.2039;0.9961 0.7922 0.2;0.9922 0.7961 0.1961;0.9922 0.8039 0.1922;0.9922 0.8078 0.1922;0.9882 0.8157 0.1882;0.9843 0.8235 0.1843;0.9843 0.8275 0.1804;0.9804 0.8353 0.1804;0.9765 0.8392 0.1765;0.9765 0.8471 0.1725;0.9725 0.851 0.1686;0.9686 0.8588 0.1647;0.9686 0.8667 0.1647;0.9647 0.8706 0.1608;0.9647 0.8784 0.1569;0.9608 0.8824 0.1569;0.9608 0.8902 0.1529;0.9608 0.898 0.149;0.9608 0.902 0.149;0.9608 0.9098 0.1451;0.9608 0.9137 0.1412;0.9608 0.9216 0.1373;0.9608 0.9255 0.1333;0.9608 0.9333 0.1294;0.9608 0.9412 0.1294;0.9608 0.949 0.1216;0.9608 0.949 0.1216;0.9686 0.9608 0.1098;0.9686 0.9608 0.1098;0.9686 0.9686 0.102;0 0 0;1 1 1;1 1 1];
+            app.BFigure.XTick = [];
+            app.BFigure.YTick = [];
+            app.BFigure.FontSize = 13;
+            app.BFigure.NextPlot = 'replace';
+            app.BFigure.Tag = 'BFigure';
+            app.BFigure.Position = [21 638 200 200];
+
+            % Create CFigure
+            app.CFigure = uiaxes(app.figure1);
+            app.CFigure.Colormap = [0.2824 0.3294 0.9647;0.2784 0.3373 0.9686;0.2784 0.3412 0.9686;0.2784 0.349 0.9725;0.2784 0.3529 0.9765;0.2784 0.3569 0.9804;0.2784 0.3647 0.9804;0.2745 0.3686 0.9843;0.2745 0.3765 0.9843;0.2745 0.3804 0.9882;0.2706 0.3843 0.9882;0.2706 0.3922 0.9922;0.2667 0.3961 0.9922;0.2627 0.4039 0.9922;0.2627 0.4078 0.9961;0.2588 0.4157 0.9961;0.2549 0.4196 0.9961;0.251 0.4275 0.9961;0.2471 0.4314 1;0.2431 0.4392 1;0.2353 0.4431 1;0.2314 0.451 1;0.2235 0.4549 1;0.2196 0.4627 0.9961;0.2118 0.4667 0.9961;0.2078 0.4745 0.9922;0.2 0.4784 0.9922;0.1961 0.4863 0.9882;0.1922 0.4902 0.9882;0.1882 0.498 0.9843;0.1843 0.502 0.9804;0.1843 0.5098 0.9804;0.1804 0.5137 0.9765;0.1804 0.5176 0.9725;0.1804 0.5255 0.9725;0.1804 0.5294 0.9686;0.1765 0.5333 0.9647;0.1765 0.5412 0.9608;0.1765 0.5451 0.9569;0.1765 0.549 0.9529;0.1765 0.5569 0.949;0.1725 0.5608 0.9451;0.1725 0.5647 0.9412;0.1686 0.5686 0.9373;0.1647 0.5765 0.9333;0.1608 0.5804 0.9294;0.1569 0.5843 0.9255;0.1529 0.5922 0.9216;0.1529 0.5961 0.9176;0.149 0.6 0.9137;0.149 0.6039 0.9098;0.1451 0.6078 0.9098;0.1451 0.6118 0.9059;0.1412 0.6196 0.902;0.1412 0.6235 0.898;0.1373 0.6275 0.898;0.1373 0.6314 0.8941;0.1333 0.6353 0.8941;0.1294 0.6392 0.8902;0.1255 0.6471 0.8902;0.1216 0.651 0.8863;0.1176 0.6549 0.8824;0.1137 0.6588 0.8824;0.1137 0.6627 0.8784;0.1098 0.6667 0.8745;0.1059 0.6706 0.8706;0.102 0.6745 0.8667;0.098 0.6784 0.8627;0.0902 0.6824 0.8549;0.0863 0.6863 0.851;0.0784 0.6902 0.8471;0.0706 0.6941 0.8392;0.0627 0.698 0.8353;0.0549 0.702 0.8314;0.0431 0.702 0.8235;0.0314 0.7059 0.8196;0.0235 0.7098 0.8118;0.0157 0.7137 0.8078;0.0078 0.7176 0.8;0.0039 0.7176 0.7922;0 0.7216 0.7882;0 0.7255 0.7804;0 0.7294 0.7765;0.0039 0.7294 0.7686;0.0078 0.7333 0.7608;0.0157 0.7333 0.7569;0.0235 0.7373 0.749;0.0353 0.7412 0.7412;0.051 0.7412 0.7373;0.0627 0.7451 0.7294;0.0784 0.7451 0.7216;0.0902 0.749 0.7137;0.102 0.7529 0.7098;0.1137 0.7529 0.702;0.1255 0.7569 0.6941;0.1373 0.7569 0.6863;0.1451 0.7608 0.6824;0.1529 0.7608 0.6745;0.1608 0.7647 0.6667;0.1686 0.7647 0.6588;0.1725 0.7686 0.651;0.1804 0.7686 0.6471;0.1843 0.7725 0.6392;0.1922 0.7725 0.6314;0.1961 0.7765 0.6235;0.2 0.7804 0.6157;0.2078 0.7804 0.6078;0.2118 0.7843 0.6;0.2196 0.7843 0.5882;0.2235 0.7882 0.5804;0.2314 0.7882 0.5725;0.2392 0.7922 0.5647;0.251 0.7922 0.5529;0.2588 0.7922 0.5451;0.2706 0.7961 0.5373;0.2824 0.7961 0.5255;0.2941 0.7961 0.5176;0.3059 0.8 0.5059;0.3176 0.8 0.498;0.3294 0.8 0.4863;0.3412 0.8 0.4784;0.3529 0.8 0.4667;0.3686 0.8039 0.4549;0.3804 0.8039 0.4471;0.3922 0.8039 0.4353;0.4039 0.8039 0.4235;0.4196 0.8039 0.4118;0.4314 0.8039 0.4;0.4471 0.8039 0.3922;0.4627 0.8 0.3804;0.4745 0.8 0.3686;0.4902 0.8 0.3569;0.5059 0.8 0.349;0.5176 0.8 0.3373;0.5333 0.7961 0.3255;0.5451 0.7961 0.3176;0.5608 0.7961 0.3059;0.5765 0.7922 0.2941;0.5882 0.7922 0.2824;0.6039 0.7882 0.2745;0.6157 0.7882 0.2627;0.6314 0.7843 0.251;0.6431 0.7843 0.2431;0.6549 0.7804 0.2314;0.6706 0.7804 0.2235;0.6824 0.7765 0.2157;0.698 0.7765 0.2078;0.7098 0.7725 0.2;0.7216 0.7686 0.1922;0.7333 0.7686 0.1843;0.7451 0.7647 0.1765;0.7608 0.7647 0.1725;0.7725 0.7608 0.1647;0.7843 0.7569 0.1608;0.7961 0.7569 0.1569;0.8078 0.7529 0.1529;0.8157 0.749 0.1529;0.8275 0.749 0.1529;0.8392 0.7451 0.1529;0.851 0.7451 0.1569;0.8588 0.7412 0.1569;0.8706 0.7373 0.1608;0.8824 0.7373 0.1647;0.8902 0.7373 0.1686;0.902 0.7333 0.1765;0.9098 0.7333 0.1804;0.9176 0.7294 0.1882;0.9255 0.7294 0.1961;0.9373 0.7294 0.2078;0.9451 0.7294 0.2157;0.9529 0.7294 0.2235;0.9608 0.7294 0.2314;0.9686 0.7294 0.2392;0.9765 0.7294 0.2431;0.9843 0.7333 0.2431;0.9882 0.7373 0.2431;0.9961 0.7412 0.2392;0.9961 0.7451 0.2353;0.9961 0.7529 0.2314;0.9961 0.7569 0.2275;0.9961 0.7608 0.2235;0.9961 0.7686 0.2196;0.9961 0.7725 0.2157;0.9961 0.7804 0.2078;0.9961 0.7843 0.2039;0.9961 0.7922 0.2;0.9922 0.7961 0.1961;0.9922 0.8039 0.1922;0.9922 0.8078 0.1922;0.9882 0.8157 0.1882;0.9843 0.8235 0.1843;0.9843 0.8275 0.1804;0.9804 0.8353 0.1804;0.9765 0.8392 0.1765;0.9765 0.8471 0.1725;0.9725 0.851 0.1686;0.9686 0.8588 0.1647;0.9686 0.8667 0.1647;0.9647 0.8706 0.1608;0.9647 0.8784 0.1569;0.9608 0.8824 0.1569;0.9608 0.8902 0.1529;0.9608 0.898 0.149;0.9608 0.902 0.149;0.9608 0.9098 0.1451;0.9608 0.9137 0.1412;0.9608 0.9216 0.1373;0.9608 0.9255 0.1333;0.9608 0.9333 0.1294;0.9608 0.9412 0.1294;0.9608 0.949 0.1216;0.9608 0.949 0.1216;0.9686 0.9608 0.1098;0.9686 0.9608 0.1098;0.9686 0.9686 0.102;0 0 0;1 1 1;1 1 1];
+            app.CFigure.XTick = [];
+            app.CFigure.YTick = [];
+            app.CFigure.FontSize = 13;
+            app.CFigure.NextPlot = 'replace';
+            app.CFigure.Tag = 'CFigure';
+            app.CFigure.Position = [251 638 200 200];
+
+            % Create AFigure
+            app.AFigure = uiaxes(app.figure1);
+            app.AFigure.Colormap = [0.2824 0.3294 0.9647;0.2784 0.3373 0.9686;0.2784 0.3412 0.9686;0.2784 0.349 0.9725;0.2784 0.3529 0.9765;0.2784 0.3569 0.9804;0.2784 0.3647 0.9804;0.2745 0.3686 0.9843;0.2745 0.3765 0.9843;0.2745 0.3804 0.9882;0.2706 0.3843 0.9882;0.2706 0.3922 0.9922;0.2667 0.3961 0.9922;0.2627 0.4039 0.9922;0.2627 0.4078 0.9961;0.2588 0.4157 0.9961;0.2549 0.4196 0.9961;0.251 0.4275 0.9961;0.2471 0.4314 1;0.2431 0.4392 1;0.2353 0.4431 1;0.2314 0.451 1;0.2235 0.4549 1;0.2196 0.4627 0.9961;0.2118 0.4667 0.9961;0.2078 0.4745 0.9922;0.2 0.4784 0.9922;0.1961 0.4863 0.9882;0.1922 0.4902 0.9882;0.1882 0.498 0.9843;0.1843 0.502 0.9804;0.1843 0.5098 0.9804;0.1804 0.5137 0.9765;0.1804 0.5176 0.9725;0.1804 0.5255 0.9725;0.1804 0.5294 0.9686;0.1765 0.5333 0.9647;0.1765 0.5412 0.9608;0.1765 0.5451 0.9569;0.1765 0.549 0.9529;0.1765 0.5569 0.949;0.1725 0.5608 0.9451;0.1725 0.5647 0.9412;0.1686 0.5686 0.9373;0.1647 0.5765 0.9333;0.1608 0.5804 0.9294;0.1569 0.5843 0.9255;0.1529 0.5922 0.9216;0.1529 0.5961 0.9176;0.149 0.6 0.9137;0.149 0.6039 0.9098;0.1451 0.6078 0.9098;0.1451 0.6118 0.9059;0.1412 0.6196 0.902;0.1412 0.6235 0.898;0.1373 0.6275 0.898;0.1373 0.6314 0.8941;0.1333 0.6353 0.8941;0.1294 0.6392 0.8902;0.1255 0.6471 0.8902;0.1216 0.651 0.8863;0.1176 0.6549 0.8824;0.1137 0.6588 0.8824;0.1137 0.6627 0.8784;0.1098 0.6667 0.8745;0.1059 0.6706 0.8706;0.102 0.6745 0.8667;0.098 0.6784 0.8627;0.0902 0.6824 0.8549;0.0863 0.6863 0.851;0.0784 0.6902 0.8471;0.0706 0.6941 0.8392;0.0627 0.698 0.8353;0.0549 0.702 0.8314;0.0431 0.702 0.8235;0.0314 0.7059 0.8196;0.0235 0.7098 0.8118;0.0157 0.7137 0.8078;0.0078 0.7176 0.8;0.0039 0.7176 0.7922;0 0.7216 0.7882;0 0.7255 0.7804;0 0.7294 0.7765;0.0039 0.7294 0.7686;0.0078 0.7333 0.7608;0.0157 0.7333 0.7569;0.0235 0.7373 0.749;0.0353 0.7412 0.7412;0.051 0.7412 0.7373;0.0627 0.7451 0.7294;0.0784 0.7451 0.7216;0.0902 0.749 0.7137;0.102 0.7529 0.7098;0.1137 0.7529 0.702;0.1255 0.7569 0.6941;0.1373 0.7569 0.6863;0.1451 0.7608 0.6824;0.1529 0.7608 0.6745;0.1608 0.7647 0.6667;0.1686 0.7647 0.6588;0.1725 0.7686 0.651;0.1804 0.7686 0.6471;0.1843 0.7725 0.6392;0.1922 0.7725 0.6314;0.1961 0.7765 0.6235;0.2 0.7804 0.6157;0.2078 0.7804 0.6078;0.2118 0.7843 0.6;0.2196 0.7843 0.5882;0.2235 0.7882 0.5804;0.2314 0.7882 0.5725;0.2392 0.7922 0.5647;0.251 0.7922 0.5529;0.2588 0.7922 0.5451;0.2706 0.7961 0.5373;0.2824 0.7961 0.5255;0.2941 0.7961 0.5176;0.3059 0.8 0.5059;0.3176 0.8 0.498;0.3294 0.8 0.4863;0.3412 0.8 0.4784;0.3529 0.8 0.4667;0.3686 0.8039 0.4549;0.3804 0.8039 0.4471;0.3922 0.8039 0.4353;0.4039 0.8039 0.4235;0.4196 0.8039 0.4118;0.4314 0.8039 0.4;0.4471 0.8039 0.3922;0.4627 0.8 0.3804;0.4745 0.8 0.3686;0.4902 0.8 0.3569;0.5059 0.8 0.349;0.5176 0.8 0.3373;0.5333 0.7961 0.3255;0.5451 0.7961 0.3176;0.5608 0.7961 0.3059;0.5765 0.7922 0.2941;0.5882 0.7922 0.2824;0.6039 0.7882 0.2745;0.6157 0.7882 0.2627;0.6314 0.7843 0.251;0.6431 0.7843 0.2431;0.6549 0.7804 0.2314;0.6706 0.7804 0.2235;0.6824 0.7765 0.2157;0.698 0.7765 0.2078;0.7098 0.7725 0.2;0.7216 0.7686 0.1922;0.7333 0.7686 0.1843;0.7451 0.7647 0.1765;0.7608 0.7647 0.1725;0.7725 0.7608 0.1647;0.7843 0.7569 0.1608;0.7961 0.7569 0.1569;0.8078 0.7529 0.1529;0.8157 0.749 0.1529;0.8275 0.749 0.1529;0.8392 0.7451 0.1529;0.851 0.7451 0.1569;0.8588 0.7412 0.1569;0.8706 0.7373 0.1608;0.8824 0.7373 0.1647;0.8902 0.7373 0.1686;0.902 0.7333 0.1765;0.9098 0.7333 0.1804;0.9176 0.7294 0.1882;0.9255 0.7294 0.1961;0.9373 0.7294 0.2078;0.9451 0.7294 0.2157;0.9529 0.7294 0.2235;0.9608 0.7294 0.2314;0.9686 0.7294 0.2392;0.9765 0.7294 0.2431;0.9843 0.7333 0.2431;0.9882 0.7373 0.2431;0.9961 0.7412 0.2392;0.9961 0.7451 0.2353;0.9961 0.7529 0.2314;0.9961 0.7569 0.2275;0.9961 0.7608 0.2235;0.9961 0.7686 0.2196;0.9961 0.7725 0.2157;0.9961 0.7804 0.2078;0.9961 0.7843 0.2039;0.9961 0.7922 0.2;0.9922 0.7961 0.1961;0.9922 0.8039 0.1922;0.9922 0.8078 0.1922;0.9882 0.8157 0.1882;0.9843 0.8235 0.1843;0.9843 0.8275 0.1804;0.9804 0.8353 0.1804;0.9765 0.8392 0.1765;0.9765 0.8471 0.1725;0.9725 0.851 0.1686;0.9686 0.8588 0.1647;0.9686 0.8667 0.1647;0.9647 0.8706 0.1608;0.9647 0.8784 0.1569;0.9608 0.8824 0.1569;0.9608 0.8902 0.1529;0.9608 0.898 0.149;0.9608 0.902 0.149;0.9608 0.9098 0.1451;0.9608 0.9137 0.1412;0.9608 0.9216 0.1373;0.9608 0.9255 0.1333;0.9608 0.9333 0.1294;0.9608 0.9412 0.1294;0.9608 0.949 0.1216;0.9608 0.949 0.1216;0.9686 0.9608 0.1098;0.9686 0.9608 0.1098;0.9686 0.9686 0.102;0 0 0;1 1 1;1 1 1];
+            app.AFigure.XTick = [];
+            app.AFigure.YTick = [];
+            app.AFigure.FontSize = 13;
+            app.AFigure.NextPlot = 'replace';
+            app.AFigure.Tag = 'AFigure';
+            app.AFigure.Position = [481 638 200 200];
+
+            % Create myBFigure
+            app.myBFigure = uiaxes(app.figure1);
+            app.myBFigure.Colormap = [0.2824 0.3294 0.9647;0.2784 0.3373 0.9686;0.2784 0.3412 0.9686;0.2784 0.349 0.9725;0.2784 0.3529 0.9765;0.2784 0.3569 0.9804;0.2784 0.3647 0.9804;0.2745 0.3686 0.9843;0.2745 0.3765 0.9843;0.2745 0.3804 0.9882;0.2706 0.3843 0.9882;0.2706 0.3922 0.9922;0.2667 0.3961 0.9922;0.2627 0.4039 0.9922;0.2627 0.4078 0.9961;0.2588 0.4157 0.9961;0.2549 0.4196 0.9961;0.251 0.4275 0.9961;0.2471 0.4314 1;0.2431 0.4392 1;0.2353 0.4431 1;0.2314 0.451 1;0.2235 0.4549 1;0.2196 0.4627 0.9961;0.2118 0.4667 0.9961;0.2078 0.4745 0.9922;0.2 0.4784 0.9922;0.1961 0.4863 0.9882;0.1922 0.4902 0.9882;0.1882 0.498 0.9843;0.1843 0.502 0.9804;0.1843 0.5098 0.9804;0.1804 0.5137 0.9765;0.1804 0.5176 0.9725;0.1804 0.5255 0.9725;0.1804 0.5294 0.9686;0.1765 0.5333 0.9647;0.1765 0.5412 0.9608;0.1765 0.5451 0.9569;0.1765 0.549 0.9529;0.1765 0.5569 0.949;0.1725 0.5608 0.9451;0.1725 0.5647 0.9412;0.1686 0.5686 0.9373;0.1647 0.5765 0.9333;0.1608 0.5804 0.9294;0.1569 0.5843 0.9255;0.1529 0.5922 0.9216;0.1529 0.5961 0.9176;0.149 0.6 0.9137;0.149 0.6039 0.9098;0.1451 0.6078 0.9098;0.1451 0.6118 0.9059;0.1412 0.6196 0.902;0.1412 0.6235 0.898;0.1373 0.6275 0.898;0.1373 0.6314 0.8941;0.1333 0.6353 0.8941;0.1294 0.6392 0.8902;0.1255 0.6471 0.8902;0.1216 0.651 0.8863;0.1176 0.6549 0.8824;0.1137 0.6588 0.8824;0.1137 0.6627 0.8784;0.1098 0.6667 0.8745;0.1059 0.6706 0.8706;0.102 0.6745 0.8667;0.098 0.6784 0.8627;0.0902 0.6824 0.8549;0.0863 0.6863 0.851;0.0784 0.6902 0.8471;0.0706 0.6941 0.8392;0.0627 0.698 0.8353;0.0549 0.702 0.8314;0.0431 0.702 0.8235;0.0314 0.7059 0.8196;0.0235 0.7098 0.8118;0.0157 0.7137 0.8078;0.0078 0.7176 0.8;0.0039 0.7176 0.7922;0 0.7216 0.7882;0 0.7255 0.7804;0 0.7294 0.7765;0.0039 0.7294 0.7686;0.0078 0.7333 0.7608;0.0157 0.7333 0.7569;0.0235 0.7373 0.749;0.0353 0.7412 0.7412;0.051 0.7412 0.7373;0.0627 0.7451 0.7294;0.0784 0.7451 0.7216;0.0902 0.749 0.7137;0.102 0.7529 0.7098;0.1137 0.7529 0.702;0.1255 0.7569 0.6941;0.1373 0.7569 0.6863;0.1451 0.7608 0.6824;0.1529 0.7608 0.6745;0.1608 0.7647 0.6667;0.1686 0.7647 0.6588;0.1725 0.7686 0.651;0.1804 0.7686 0.6471;0.1843 0.7725 0.6392;0.1922 0.7725 0.6314;0.1961 0.7765 0.6235;0.2 0.7804 0.6157;0.2078 0.7804 0.6078;0.2118 0.7843 0.6;0.2196 0.7843 0.5882;0.2235 0.7882 0.5804;0.2314 0.7882 0.5725;0.2392 0.7922 0.5647;0.251 0.7922 0.5529;0.2588 0.7922 0.5451;0.2706 0.7961 0.5373;0.2824 0.7961 0.5255;0.2941 0.7961 0.5176;0.3059 0.8 0.5059;0.3176 0.8 0.498;0.3294 0.8 0.4863;0.3412 0.8 0.4784;0.3529 0.8 0.4667;0.3686 0.8039 0.4549;0.3804 0.8039 0.4471;0.3922 0.8039 0.4353;0.4039 0.8039 0.4235;0.4196 0.8039 0.4118;0.4314 0.8039 0.4;0.4471 0.8039 0.3922;0.4627 0.8 0.3804;0.4745 0.8 0.3686;0.4902 0.8 0.3569;0.5059 0.8 0.349;0.5176 0.8 0.3373;0.5333 0.7961 0.3255;0.5451 0.7961 0.3176;0.5608 0.7961 0.3059;0.5765 0.7922 0.2941;0.5882 0.7922 0.2824;0.6039 0.7882 0.2745;0.6157 0.7882 0.2627;0.6314 0.7843 0.251;0.6431 0.7843 0.2431;0.6549 0.7804 0.2314;0.6706 0.7804 0.2235;0.6824 0.7765 0.2157;0.698 0.7765 0.2078;0.7098 0.7725 0.2;0.7216 0.7686 0.1922;0.7333 0.7686 0.1843;0.7451 0.7647 0.1765;0.7608 0.7647 0.1725;0.7725 0.7608 0.1647;0.7843 0.7569 0.1608;0.7961 0.7569 0.1569;0.8078 0.7529 0.1529;0.8157 0.749 0.1529;0.8275 0.749 0.1529;0.8392 0.7451 0.1529;0.851 0.7451 0.1569;0.8588 0.7412 0.1569;0.8706 0.7373 0.1608;0.8824 0.7373 0.1647;0.8902 0.7373 0.1686;0.902 0.7333 0.1765;0.9098 0.7333 0.1804;0.9176 0.7294 0.1882;0.9255 0.7294 0.1961;0.9373 0.7294 0.2078;0.9451 0.7294 0.2157;0.9529 0.7294 0.2235;0.9608 0.7294 0.2314;0.9686 0.7294 0.2392;0.9765 0.7294 0.2431;0.9843 0.7333 0.2431;0.9882 0.7373 0.2431;0.9961 0.7412 0.2392;0.9961 0.7451 0.2353;0.9961 0.7529 0.2314;0.9961 0.7569 0.2275;0.9961 0.7608 0.2235;0.9961 0.7686 0.2196;0.9961 0.7725 0.2157;0.9961 0.7804 0.2078;0.9961 0.7843 0.2039;0.9961 0.7922 0.2;0.9922 0.7961 0.1961;0.9922 0.8039 0.1922;0.9922 0.8078 0.1922;0.9882 0.8157 0.1882;0.9843 0.8235 0.1843;0.9843 0.8275 0.1804;0.9804 0.8353 0.1804;0.9765 0.8392 0.1765;0.9765 0.8471 0.1725;0.9725 0.851 0.1686;0.9686 0.8588 0.1647;0.9686 0.8667 0.1647;0.9647 0.8706 0.1608;0.9647 0.8784 0.1569;0.9608 0.8824 0.1569;0.9608 0.8902 0.1529;0.9608 0.898 0.149;0.9608 0.902 0.149;0.9608 0.9098 0.1451;0.9608 0.9137 0.1412;0.9608 0.9216 0.1373;0.9608 0.9255 0.1333;0.9608 0.9333 0.1294;0.9608 0.9412 0.1294;0.9608 0.949 0.1216;0.9608 0.949 0.1216;0.9686 0.9608 0.1098;0.9686 0.9608 0.1098;0.9686 0.9686 0.102;0 0 0;1 1 1;1 1 1];
+            app.myBFigure.XTick = [];
+            app.myBFigure.YTick = [];
+            app.myBFigure.FontSize = 13;
+            app.myBFigure.NextPlot = 'replace';
+            app.myBFigure.Tag = 'myBFigure';
+            app.myBFigure.Position = [21 428 200 200];
+
+            % Create myCFigure
+            app.myCFigure = uiaxes(app.figure1);
+            app.myCFigure.Colormap = [0.2824 0.3294 0.9647;0.2784 0.3373 0.9686;0.2784 0.3412 0.9686;0.2784 0.349 0.9725;0.2784 0.3529 0.9765;0.2784 0.3569 0.9804;0.2784 0.3647 0.9804;0.2745 0.3686 0.9843;0.2745 0.3765 0.9843;0.2745 0.3804 0.9882;0.2706 0.3843 0.9882;0.2706 0.3922 0.9922;0.2667 0.3961 0.9922;0.2627 0.4039 0.9922;0.2627 0.4078 0.9961;0.2588 0.4157 0.9961;0.2549 0.4196 0.9961;0.251 0.4275 0.9961;0.2471 0.4314 1;0.2431 0.4392 1;0.2353 0.4431 1;0.2314 0.451 1;0.2235 0.4549 1;0.2196 0.4627 0.9961;0.2118 0.4667 0.9961;0.2078 0.4745 0.9922;0.2 0.4784 0.9922;0.1961 0.4863 0.9882;0.1922 0.4902 0.9882;0.1882 0.498 0.9843;0.1843 0.502 0.9804;0.1843 0.5098 0.9804;0.1804 0.5137 0.9765;0.1804 0.5176 0.9725;0.1804 0.5255 0.9725;0.1804 0.5294 0.9686;0.1765 0.5333 0.9647;0.1765 0.5412 0.9608;0.1765 0.5451 0.9569;0.1765 0.549 0.9529;0.1765 0.5569 0.949;0.1725 0.5608 0.9451;0.1725 0.5647 0.9412;0.1686 0.5686 0.9373;0.1647 0.5765 0.9333;0.1608 0.5804 0.9294;0.1569 0.5843 0.9255;0.1529 0.5922 0.9216;0.1529 0.5961 0.9176;0.149 0.6 0.9137;0.149 0.6039 0.9098;0.1451 0.6078 0.9098;0.1451 0.6118 0.9059;0.1412 0.6196 0.902;0.1412 0.6235 0.898;0.1373 0.6275 0.898;0.1373 0.6314 0.8941;0.1333 0.6353 0.8941;0.1294 0.6392 0.8902;0.1255 0.6471 0.8902;0.1216 0.651 0.8863;0.1176 0.6549 0.8824;0.1137 0.6588 0.8824;0.1137 0.6627 0.8784;0.1098 0.6667 0.8745;0.1059 0.6706 0.8706;0.102 0.6745 0.8667;0.098 0.6784 0.8627;0.0902 0.6824 0.8549;0.0863 0.6863 0.851;0.0784 0.6902 0.8471;0.0706 0.6941 0.8392;0.0627 0.698 0.8353;0.0549 0.702 0.8314;0.0431 0.702 0.8235;0.0314 0.7059 0.8196;0.0235 0.7098 0.8118;0.0157 0.7137 0.8078;0.0078 0.7176 0.8;0.0039 0.7176 0.7922;0 0.7216 0.7882;0 0.7255 0.7804;0 0.7294 0.7765;0.0039 0.7294 0.7686;0.0078 0.7333 0.7608;0.0157 0.7333 0.7569;0.0235 0.7373 0.749;0.0353 0.7412 0.7412;0.051 0.7412 0.7373;0.0627 0.7451 0.7294;0.0784 0.7451 0.7216;0.0902 0.749 0.7137;0.102 0.7529 0.7098;0.1137 0.7529 0.702;0.1255 0.7569 0.6941;0.1373 0.7569 0.6863;0.1451 0.7608 0.6824;0.1529 0.7608 0.6745;0.1608 0.7647 0.6667;0.1686 0.7647 0.6588;0.1725 0.7686 0.651;0.1804 0.7686 0.6471;0.1843 0.7725 0.6392;0.1922 0.7725 0.6314;0.1961 0.7765 0.6235;0.2 0.7804 0.6157;0.2078 0.7804 0.6078;0.2118 0.7843 0.6;0.2196 0.7843 0.5882;0.2235 0.7882 0.5804;0.2314 0.7882 0.5725;0.2392 0.7922 0.5647;0.251 0.7922 0.5529;0.2588 0.7922 0.5451;0.2706 0.7961 0.5373;0.2824 0.7961 0.5255;0.2941 0.7961 0.5176;0.3059 0.8 0.5059;0.3176 0.8 0.498;0.3294 0.8 0.4863;0.3412 0.8 0.4784;0.3529 0.8 0.4667;0.3686 0.8039 0.4549;0.3804 0.8039 0.4471;0.3922 0.8039 0.4353;0.4039 0.8039 0.4235;0.4196 0.8039 0.4118;0.4314 0.8039 0.4;0.4471 0.8039 0.3922;0.4627 0.8 0.3804;0.4745 0.8 0.3686;0.4902 0.8 0.3569;0.5059 0.8 0.349;0.5176 0.8 0.3373;0.5333 0.7961 0.3255;0.5451 0.7961 0.3176;0.5608 0.7961 0.3059;0.5765 0.7922 0.2941;0.5882 0.7922 0.2824;0.6039 0.7882 0.2745;0.6157 0.7882 0.2627;0.6314 0.7843 0.251;0.6431 0.7843 0.2431;0.6549 0.7804 0.2314;0.6706 0.7804 0.2235;0.6824 0.7765 0.2157;0.698 0.7765 0.2078;0.7098 0.7725 0.2;0.7216 0.7686 0.1922;0.7333 0.7686 0.1843;0.7451 0.7647 0.1765;0.7608 0.7647 0.1725;0.7725 0.7608 0.1647;0.7843 0.7569 0.1608;0.7961 0.7569 0.1569;0.8078 0.7529 0.1529;0.8157 0.749 0.1529;0.8275 0.749 0.1529;0.8392 0.7451 0.1529;0.851 0.7451 0.1569;0.8588 0.7412 0.1569;0.8706 0.7373 0.1608;0.8824 0.7373 0.1647;0.8902 0.7373 0.1686;0.902 0.7333 0.1765;0.9098 0.7333 0.1804;0.9176 0.7294 0.1882;0.9255 0.7294 0.1961;0.9373 0.7294 0.2078;0.9451 0.7294 0.2157;0.9529 0.7294 0.2235;0.9608 0.7294 0.2314;0.9686 0.7294 0.2392;0.9765 0.7294 0.2431;0.9843 0.7333 0.2431;0.9882 0.7373 0.2431;0.9961 0.7412 0.2392;0.9961 0.7451 0.2353;0.9961 0.7529 0.2314;0.9961 0.7569 0.2275;0.9961 0.7608 0.2235;0.9961 0.7686 0.2196;0.9961 0.7725 0.2157;0.9961 0.7804 0.2078;0.9961 0.7843 0.2039;0.9961 0.7922 0.2;0.9922 0.7961 0.1961;0.9922 0.8039 0.1922;0.9922 0.8078 0.1922;0.9882 0.8157 0.1882;0.9843 0.8235 0.1843;0.9843 0.8275 0.1804;0.9804 0.8353 0.1804;0.9765 0.8392 0.1765;0.9765 0.8471 0.1725;0.9725 0.851 0.1686;0.9686 0.8588 0.1647;0.9686 0.8667 0.1647;0.9647 0.8706 0.1608;0.9647 0.8784 0.1569;0.9608 0.8824 0.1569;0.9608 0.8902 0.1529;0.9608 0.898 0.149;0.9608 0.902 0.149;0.9608 0.9098 0.1451;0.9608 0.9137 0.1412;0.9608 0.9216 0.1373;0.9608 0.9255 0.1333;0.9608 0.9333 0.1294;0.9608 0.9412 0.1294;0.9608 0.949 0.1216;0.9608 0.949 0.1216;0.9686 0.9608 0.1098;0.9686 0.9608 0.1098;0.9686 0.9686 0.102;0 0 0;1 1 1;1 1 1];
+            app.myCFigure.XTick = [];
+            app.myCFigure.YTick = [];
+            app.myCFigure.FontSize = 13;
+            app.myCFigure.NextPlot = 'replace';
+            app.myCFigure.Tag = 'myCFigure';
+            app.myCFigure.Position = [251 428 200 200];
+
+            % Create myAFigure
+            app.myAFigure = uiaxes(app.figure1);
+            app.myAFigure.Colormap = [0.2824 0.3294 0.9647;0.2784 0.3373 0.9686;0.2784 0.3412 0.9686;0.2784 0.349 0.9725;0.2784 0.3529 0.9765;0.2784 0.3569 0.9804;0.2784 0.3647 0.9804;0.2745 0.3686 0.9843;0.2745 0.3765 0.9843;0.2745 0.3804 0.9882;0.2706 0.3843 0.9882;0.2706 0.3922 0.9922;0.2667 0.3961 0.9922;0.2627 0.4039 0.9922;0.2627 0.4078 0.9961;0.2588 0.4157 0.9961;0.2549 0.4196 0.9961;0.251 0.4275 0.9961;0.2471 0.4314 1;0.2431 0.4392 1;0.2353 0.4431 1;0.2314 0.451 1;0.2235 0.4549 1;0.2196 0.4627 0.9961;0.2118 0.4667 0.9961;0.2078 0.4745 0.9922;0.2 0.4784 0.9922;0.1961 0.4863 0.9882;0.1922 0.4902 0.9882;0.1882 0.498 0.9843;0.1843 0.502 0.9804;0.1843 0.5098 0.9804;0.1804 0.5137 0.9765;0.1804 0.5176 0.9725;0.1804 0.5255 0.9725;0.1804 0.5294 0.9686;0.1765 0.5333 0.9647;0.1765 0.5412 0.9608;0.1765 0.5451 0.9569;0.1765 0.549 0.9529;0.1765 0.5569 0.949;0.1725 0.5608 0.9451;0.1725 0.5647 0.9412;0.1686 0.5686 0.9373;0.1647 0.5765 0.9333;0.1608 0.5804 0.9294;0.1569 0.5843 0.9255;0.1529 0.5922 0.9216;0.1529 0.5961 0.9176;0.149 0.6 0.9137;0.149 0.6039 0.9098;0.1451 0.6078 0.9098;0.1451 0.6118 0.9059;0.1412 0.6196 0.902;0.1412 0.6235 0.898;0.1373 0.6275 0.898;0.1373 0.6314 0.8941;0.1333 0.6353 0.8941;0.1294 0.6392 0.8902;0.1255 0.6471 0.8902;0.1216 0.651 0.8863;0.1176 0.6549 0.8824;0.1137 0.6588 0.8824;0.1137 0.6627 0.8784;0.1098 0.6667 0.8745;0.1059 0.6706 0.8706;0.102 0.6745 0.8667;0.098 0.6784 0.8627;0.0902 0.6824 0.8549;0.0863 0.6863 0.851;0.0784 0.6902 0.8471;0.0706 0.6941 0.8392;0.0627 0.698 0.8353;0.0549 0.702 0.8314;0.0431 0.702 0.8235;0.0314 0.7059 0.8196;0.0235 0.7098 0.8118;0.0157 0.7137 0.8078;0.0078 0.7176 0.8;0.0039 0.7176 0.7922;0 0.7216 0.7882;0 0.7255 0.7804;0 0.7294 0.7765;0.0039 0.7294 0.7686;0.0078 0.7333 0.7608;0.0157 0.7333 0.7569;0.0235 0.7373 0.749;0.0353 0.7412 0.7412;0.051 0.7412 0.7373;0.0627 0.7451 0.7294;0.0784 0.7451 0.7216;0.0902 0.749 0.7137;0.102 0.7529 0.7098;0.1137 0.7529 0.702;0.1255 0.7569 0.6941;0.1373 0.7569 0.6863;0.1451 0.7608 0.6824;0.1529 0.7608 0.6745;0.1608 0.7647 0.6667;0.1686 0.7647 0.6588;0.1725 0.7686 0.651;0.1804 0.7686 0.6471;0.1843 0.7725 0.6392;0.1922 0.7725 0.6314;0.1961 0.7765 0.6235;0.2 0.7804 0.6157;0.2078 0.7804 0.6078;0.2118 0.7843 0.6;0.2196 0.7843 0.5882;0.2235 0.7882 0.5804;0.2314 0.7882 0.5725;0.2392 0.7922 0.5647;0.251 0.7922 0.5529;0.2588 0.7922 0.5451;0.2706 0.7961 0.5373;0.2824 0.7961 0.5255;0.2941 0.7961 0.5176;0.3059 0.8 0.5059;0.3176 0.8 0.498;0.3294 0.8 0.4863;0.3412 0.8 0.4784;0.3529 0.8 0.4667;0.3686 0.8039 0.4549;0.3804 0.8039 0.4471;0.3922 0.8039 0.4353;0.4039 0.8039 0.4235;0.4196 0.8039 0.4118;0.4314 0.8039 0.4;0.4471 0.8039 0.3922;0.4627 0.8 0.3804;0.4745 0.8 0.3686;0.4902 0.8 0.3569;0.5059 0.8 0.349;0.5176 0.8 0.3373;0.5333 0.7961 0.3255;0.5451 0.7961 0.3176;0.5608 0.7961 0.3059;0.5765 0.7922 0.2941;0.5882 0.7922 0.2824;0.6039 0.7882 0.2745;0.6157 0.7882 0.2627;0.6314 0.7843 0.251;0.6431 0.7843 0.2431;0.6549 0.7804 0.2314;0.6706 0.7804 0.2235;0.6824 0.7765 0.2157;0.698 0.7765 0.2078;0.7098 0.7725 0.2;0.7216 0.7686 0.1922;0.7333 0.7686 0.1843;0.7451 0.7647 0.1765;0.7608 0.7647 0.1725;0.7725 0.7608 0.1647;0.7843 0.7569 0.1608;0.7961 0.7569 0.1569;0.8078 0.7529 0.1529;0.8157 0.749 0.1529;0.8275 0.749 0.1529;0.8392 0.7451 0.1529;0.851 0.7451 0.1569;0.8588 0.7412 0.1569;0.8706 0.7373 0.1608;0.8824 0.7373 0.1647;0.8902 0.7373 0.1686;0.902 0.7333 0.1765;0.9098 0.7333 0.1804;0.9176 0.7294 0.1882;0.9255 0.7294 0.1961;0.9373 0.7294 0.2078;0.9451 0.7294 0.2157;0.9529 0.7294 0.2235;0.9608 0.7294 0.2314;0.9686 0.7294 0.2392;0.9765 0.7294 0.2431;0.9843 0.7333 0.2431;0.9882 0.7373 0.2431;0.9961 0.7412 0.2392;0.9961 0.7451 0.2353;0.9961 0.7529 0.2314;0.9961 0.7569 0.2275;0.9961 0.7608 0.2235;0.9961 0.7686 0.2196;0.9961 0.7725 0.2157;0.9961 0.7804 0.2078;0.9961 0.7843 0.2039;0.9961 0.7922 0.2;0.9922 0.7961 0.1961;0.9922 0.8039 0.1922;0.9922 0.8078 0.1922;0.9882 0.8157 0.1882;0.9843 0.8235 0.1843;0.9843 0.8275 0.1804;0.9804 0.8353 0.1804;0.9765 0.8392 0.1765;0.9765 0.8471 0.1725;0.9725 0.851 0.1686;0.9686 0.8588 0.1647;0.9686 0.8667 0.1647;0.9647 0.8706 0.1608;0.9647 0.8784 0.1569;0.9608 0.8824 0.1569;0.9608 0.8902 0.1529;0.9608 0.898 0.149;0.9608 0.902 0.149;0.9608 0.9098 0.1451;0.9608 0.9137 0.1412;0.9608 0.9216 0.1373;0.9608 0.9255 0.1333;0.9608 0.9333 0.1294;0.9608 0.9412 0.1294;0.9608 0.949 0.1216;0.9608 0.949 0.1216;0.9686 0.9608 0.1098;0.9686 0.9608 0.1098;0.9686 0.9686 0.102;0 0 0;1 1 1;1 1 1];
+            app.myAFigure.XTick = [];
+            app.myAFigure.YTick = [];
+            app.myAFigure.FontSize = 13;
+            app.myAFigure.NextPlot = 'replace';
+            app.myAFigure.Tag = 'myAFigure';
+            app.myAFigure.Position = [481 428 200 200];
+
+            % Create metric1Figure
+            app.metric1Figure = uiaxes(app.figure1);
+            app.metric1Figure.Colormap = [0.2824 0.3294 0.9647;0.2784 0.3373 0.9686;0.2784 0.3412 0.9686;0.2784 0.349 0.9725;0.2784 0.3529 0.9765;0.2784 0.3569 0.9804;0.2784 0.3647 0.9804;0.2745 0.3686 0.9843;0.2745 0.3765 0.9843;0.2745 0.3804 0.9882;0.2706 0.3843 0.9882;0.2706 0.3922 0.9922;0.2667 0.3961 0.9922;0.2627 0.4039 0.9922;0.2627 0.4078 0.9961;0.2588 0.4157 0.9961;0.2549 0.4196 0.9961;0.251 0.4275 0.9961;0.2471 0.4314 1;0.2431 0.4392 1;0.2353 0.4431 1;0.2314 0.451 1;0.2235 0.4549 1;0.2196 0.4627 0.9961;0.2118 0.4667 0.9961;0.2078 0.4745 0.9922;0.2 0.4784 0.9922;0.1961 0.4863 0.9882;0.1922 0.4902 0.9882;0.1882 0.498 0.9843;0.1843 0.502 0.9804;0.1843 0.5098 0.9804;0.1804 0.5137 0.9765;0.1804 0.5176 0.9725;0.1804 0.5255 0.9725;0.1804 0.5294 0.9686;0.1765 0.5333 0.9647;0.1765 0.5412 0.9608;0.1765 0.5451 0.9569;0.1765 0.549 0.9529;0.1765 0.5569 0.949;0.1725 0.5608 0.9451;0.1725 0.5647 0.9412;0.1686 0.5686 0.9373;0.1647 0.5765 0.9333;0.1608 0.5804 0.9294;0.1569 0.5843 0.9255;0.1529 0.5922 0.9216;0.1529 0.5961 0.9176;0.149 0.6 0.9137;0.149 0.6039 0.9098;0.1451 0.6078 0.9098;0.1451 0.6118 0.9059;0.1412 0.6196 0.902;0.1412 0.6235 0.898;0.1373 0.6275 0.898;0.1373 0.6314 0.8941;0.1333 0.6353 0.8941;0.1294 0.6392 0.8902;0.1255 0.6471 0.8902;0.1216 0.651 0.8863;0.1176 0.6549 0.8824;0.1137 0.6588 0.8824;0.1137 0.6627 0.8784;0.1098 0.6667 0.8745;0.1059 0.6706 0.8706;0.102 0.6745 0.8667;0.098 0.6784 0.8627;0.0902 0.6824 0.8549;0.0863 0.6863 0.851;0.0784 0.6902 0.8471;0.0706 0.6941 0.8392;0.0627 0.698 0.8353;0.0549 0.702 0.8314;0.0431 0.702 0.8235;0.0314 0.7059 0.8196;0.0235 0.7098 0.8118;0.0157 0.7137 0.8078;0.0078 0.7176 0.8;0.0039 0.7176 0.7922;0 0.7216 0.7882;0 0.7255 0.7804;0 0.7294 0.7765;0.0039 0.7294 0.7686;0.0078 0.7333 0.7608;0.0157 0.7333 0.7569;0.0235 0.7373 0.749;0.0353 0.7412 0.7412;0.051 0.7412 0.7373;0.0627 0.7451 0.7294;0.0784 0.7451 0.7216;0.0902 0.749 0.7137;0.102 0.7529 0.7098;0.1137 0.7529 0.702;0.1255 0.7569 0.6941;0.1373 0.7569 0.6863;0.1451 0.7608 0.6824;0.1529 0.7608 0.6745;0.1608 0.7647 0.6667;0.1686 0.7647 0.6588;0.1725 0.7686 0.651;0.1804 0.7686 0.6471;0.1843 0.7725 0.6392;0.1922 0.7725 0.6314;0.1961 0.7765 0.6235;0.2 0.7804 0.6157;0.2078 0.7804 0.6078;0.2118 0.7843 0.6;0.2196 0.7843 0.5882;0.2235 0.7882 0.5804;0.2314 0.7882 0.5725;0.2392 0.7922 0.5647;0.251 0.7922 0.5529;0.2588 0.7922 0.5451;0.2706 0.7961 0.5373;0.2824 0.7961 0.5255;0.2941 0.7961 0.5176;0.3059 0.8 0.5059;0.3176 0.8 0.498;0.3294 0.8 0.4863;0.3412 0.8 0.4784;0.3529 0.8 0.4667;0.3686 0.8039 0.4549;0.3804 0.8039 0.4471;0.3922 0.8039 0.4353;0.4039 0.8039 0.4235;0.4196 0.8039 0.4118;0.4314 0.8039 0.4;0.4471 0.8039 0.3922;0.4627 0.8 0.3804;0.4745 0.8 0.3686;0.4902 0.8 0.3569;0.5059 0.8 0.349;0.5176 0.8 0.3373;0.5333 0.7961 0.3255;0.5451 0.7961 0.3176;0.5608 0.7961 0.3059;0.5765 0.7922 0.2941;0.5882 0.7922 0.2824;0.6039 0.7882 0.2745;0.6157 0.7882 0.2627;0.6314 0.7843 0.251;0.6431 0.7843 0.2431;0.6549 0.7804 0.2314;0.6706 0.7804 0.2235;0.6824 0.7765 0.2157;0.698 0.7765 0.2078;0.7098 0.7725 0.2;0.7216 0.7686 0.1922;0.7333 0.7686 0.1843;0.7451 0.7647 0.1765;0.7608 0.7647 0.1725;0.7725 0.7608 0.1647;0.7843 0.7569 0.1608;0.7961 0.7569 0.1569;0.8078 0.7529 0.1529;0.8157 0.749 0.1529;0.8275 0.749 0.1529;0.8392 0.7451 0.1529;0.851 0.7451 0.1569;0.8588 0.7412 0.1569;0.8706 0.7373 0.1608;0.8824 0.7373 0.1647;0.8902 0.7373 0.1686;0.902 0.7333 0.1765;0.9098 0.7333 0.1804;0.9176 0.7294 0.1882;0.9255 0.7294 0.1961;0.9373 0.7294 0.2078;0.9451 0.7294 0.2157;0.9529 0.7294 0.2235;0.9608 0.7294 0.2314;0.9686 0.7294 0.2392;0.9765 0.7294 0.2431;0.9843 0.7333 0.2431;0.9882 0.7373 0.2431;0.9961 0.7412 0.2392;0.9961 0.7451 0.2353;0.9961 0.7529 0.2314;0.9961 0.7569 0.2275;0.9961 0.7608 0.2235;0.9961 0.7686 0.2196;0.9961 0.7725 0.2157;0.9961 0.7804 0.2078;0.9961 0.7843 0.2039;0.9961 0.7922 0.2;0.9922 0.7961 0.1961;0.9922 0.8039 0.1922;0.9922 0.8078 0.1922;0.9882 0.8157 0.1882;0.9843 0.8235 0.1843;0.9843 0.8275 0.1804;0.9804 0.8353 0.1804;0.9765 0.8392 0.1765;0.9765 0.8471 0.1725;0.9725 0.851 0.1686;0.9686 0.8588 0.1647;0.9686 0.8667 0.1647;0.9647 0.8706 0.1608;0.9647 0.8784 0.1569;0.9608 0.8824 0.1569;0.9608 0.8902 0.1529;0.9608 0.898 0.149;0.9608 0.902 0.149;0.9608 0.9098 0.1451;0.9608 0.9137 0.1412;0.9608 0.9216 0.1373;0.9608 0.9255 0.1333;0.9608 0.9333 0.1294;0.9608 0.9412 0.1294;0.9608 0.949 0.1216;0.9608 0.949 0.1216;0.9686 0.9608 0.1098;0.9686 0.9608 0.1098;0.9686 0.9686 0.102;0 0 0;1 1 1;1 1 1];
+            app.metric1Figure.XTick = [];
+            app.metric1Figure.YTick = [];
+            app.metric1Figure.FontSize = 13;
+            app.metric1Figure.NextPlot = 'replace';
+            app.metric1Figure.Tag = 'metric1Figure';
+            app.metric1Figure.Position = [21 218 400 200];
+
+            % Create metric3Figure
+            app.metric3Figure = uiaxes(app.figure1);
+            app.metric3Figure.Colormap = [0.2824 0.3294 0.9647;0.2784 0.3373 0.9686;0.2784 0.3412 0.9686;0.2784 0.349 0.9725;0.2784 0.3529 0.9765;0.2784 0.3569 0.9804;0.2784 0.3647 0.9804;0.2745 0.3686 0.9843;0.2745 0.3765 0.9843;0.2745 0.3804 0.9882;0.2706 0.3843 0.9882;0.2706 0.3922 0.9922;0.2667 0.3961 0.9922;0.2627 0.4039 0.9922;0.2627 0.4078 0.9961;0.2588 0.4157 0.9961;0.2549 0.4196 0.9961;0.251 0.4275 0.9961;0.2471 0.4314 1;0.2431 0.4392 1;0.2353 0.4431 1;0.2314 0.451 1;0.2235 0.4549 1;0.2196 0.4627 0.9961;0.2118 0.4667 0.9961;0.2078 0.4745 0.9922;0.2 0.4784 0.9922;0.1961 0.4863 0.9882;0.1922 0.4902 0.9882;0.1882 0.498 0.9843;0.1843 0.502 0.9804;0.1843 0.5098 0.9804;0.1804 0.5137 0.9765;0.1804 0.5176 0.9725;0.1804 0.5255 0.9725;0.1804 0.5294 0.9686;0.1765 0.5333 0.9647;0.1765 0.5412 0.9608;0.1765 0.5451 0.9569;0.1765 0.549 0.9529;0.1765 0.5569 0.949;0.1725 0.5608 0.9451;0.1725 0.5647 0.9412;0.1686 0.5686 0.9373;0.1647 0.5765 0.9333;0.1608 0.5804 0.9294;0.1569 0.5843 0.9255;0.1529 0.5922 0.9216;0.1529 0.5961 0.9176;0.149 0.6 0.9137;0.149 0.6039 0.9098;0.1451 0.6078 0.9098;0.1451 0.6118 0.9059;0.1412 0.6196 0.902;0.1412 0.6235 0.898;0.1373 0.6275 0.898;0.1373 0.6314 0.8941;0.1333 0.6353 0.8941;0.1294 0.6392 0.8902;0.1255 0.6471 0.8902;0.1216 0.651 0.8863;0.1176 0.6549 0.8824;0.1137 0.6588 0.8824;0.1137 0.6627 0.8784;0.1098 0.6667 0.8745;0.1059 0.6706 0.8706;0.102 0.6745 0.8667;0.098 0.6784 0.8627;0.0902 0.6824 0.8549;0.0863 0.6863 0.851;0.0784 0.6902 0.8471;0.0706 0.6941 0.8392;0.0627 0.698 0.8353;0.0549 0.702 0.8314;0.0431 0.702 0.8235;0.0314 0.7059 0.8196;0.0235 0.7098 0.8118;0.0157 0.7137 0.8078;0.0078 0.7176 0.8;0.0039 0.7176 0.7922;0 0.7216 0.7882;0 0.7255 0.7804;0 0.7294 0.7765;0.0039 0.7294 0.7686;0.0078 0.7333 0.7608;0.0157 0.7333 0.7569;0.0235 0.7373 0.749;0.0353 0.7412 0.7412;0.051 0.7412 0.7373;0.0627 0.7451 0.7294;0.0784 0.7451 0.7216;0.0902 0.749 0.7137;0.102 0.7529 0.7098;0.1137 0.7529 0.702;0.1255 0.7569 0.6941;0.1373 0.7569 0.6863;0.1451 0.7608 0.6824;0.1529 0.7608 0.6745;0.1608 0.7647 0.6667;0.1686 0.7647 0.6588;0.1725 0.7686 0.651;0.1804 0.7686 0.6471;0.1843 0.7725 0.6392;0.1922 0.7725 0.6314;0.1961 0.7765 0.6235;0.2 0.7804 0.6157;0.2078 0.7804 0.6078;0.2118 0.7843 0.6;0.2196 0.7843 0.5882;0.2235 0.7882 0.5804;0.2314 0.7882 0.5725;0.2392 0.7922 0.5647;0.251 0.7922 0.5529;0.2588 0.7922 0.5451;0.2706 0.7961 0.5373;0.2824 0.7961 0.5255;0.2941 0.7961 0.5176;0.3059 0.8 0.5059;0.3176 0.8 0.498;0.3294 0.8 0.4863;0.3412 0.8 0.4784;0.3529 0.8 0.4667;0.3686 0.8039 0.4549;0.3804 0.8039 0.4471;0.3922 0.8039 0.4353;0.4039 0.8039 0.4235;0.4196 0.8039 0.4118;0.4314 0.8039 0.4;0.4471 0.8039 0.3922;0.4627 0.8 0.3804;0.4745 0.8 0.3686;0.4902 0.8 0.3569;0.5059 0.8 0.349;0.5176 0.8 0.3373;0.5333 0.7961 0.3255;0.5451 0.7961 0.3176;0.5608 0.7961 0.3059;0.5765 0.7922 0.2941;0.5882 0.7922 0.2824;0.6039 0.7882 0.2745;0.6157 0.7882 0.2627;0.6314 0.7843 0.251;0.6431 0.7843 0.2431;0.6549 0.7804 0.2314;0.6706 0.7804 0.2235;0.6824 0.7765 0.2157;0.698 0.7765 0.2078;0.7098 0.7725 0.2;0.7216 0.7686 0.1922;0.7333 0.7686 0.1843;0.7451 0.7647 0.1765;0.7608 0.7647 0.1725;0.7725 0.7608 0.1647;0.7843 0.7569 0.1608;0.7961 0.7569 0.1569;0.8078 0.7529 0.1529;0.8157 0.749 0.1529;0.8275 0.749 0.1529;0.8392 0.7451 0.1529;0.851 0.7451 0.1569;0.8588 0.7412 0.1569;0.8706 0.7373 0.1608;0.8824 0.7373 0.1647;0.8902 0.7373 0.1686;0.902 0.7333 0.1765;0.9098 0.7333 0.1804;0.9176 0.7294 0.1882;0.9255 0.7294 0.1961;0.9373 0.7294 0.2078;0.9451 0.7294 0.2157;0.9529 0.7294 0.2235;0.9608 0.7294 0.2314;0.9686 0.7294 0.2392;0.9765 0.7294 0.2431;0.9843 0.7333 0.2431;0.9882 0.7373 0.2431;0.9961 0.7412 0.2392;0.9961 0.7451 0.2353;0.9961 0.7529 0.2314;0.9961 0.7569 0.2275;0.9961 0.7608 0.2235;0.9961 0.7686 0.2196;0.9961 0.7725 0.2157;0.9961 0.7804 0.2078;0.9961 0.7843 0.2039;0.9961 0.7922 0.2;0.9922 0.7961 0.1961;0.9922 0.8039 0.1922;0.9922 0.8078 0.1922;0.9882 0.8157 0.1882;0.9843 0.8235 0.1843;0.9843 0.8275 0.1804;0.9804 0.8353 0.1804;0.9765 0.8392 0.1765;0.9765 0.8471 0.1725;0.9725 0.851 0.1686;0.9686 0.8588 0.1647;0.9686 0.8667 0.1647;0.9647 0.8706 0.1608;0.9647 0.8784 0.1569;0.9608 0.8824 0.1569;0.9608 0.8902 0.1529;0.9608 0.898 0.149;0.9608 0.902 0.149;0.9608 0.9098 0.1451;0.9608 0.9137 0.1412;0.9608 0.9216 0.1373;0.9608 0.9255 0.1333;0.9608 0.9333 0.1294;0.9608 0.9412 0.1294;0.9608 0.949 0.1216;0.9608 0.949 0.1216;0.9686 0.9608 0.1098;0.9686 0.9608 0.1098;0.9686 0.9686 0.102;0 0 0;1 1 1;1 1 1];
+            app.metric3Figure.XTick = [];
+            app.metric3Figure.YTick = [];
+            app.metric3Figure.FontSize = 13;
+            app.metric3Figure.NextPlot = 'replace';
+            app.metric3Figure.Tag = 'metric3Figure';
+            app.metric3Figure.Position = [21 11 400 200];
+
+            % Create frobeniusErrorFigure
+            app.frobeniusErrorFigure = uiaxes(app.figure1);
+            app.frobeniusErrorFigure.Colormap = [0.2824 0.3294 0.9647;0.2784 0.3373 0.9686;0.2784 0.3412 0.9686;0.2784 0.349 0.9725;0.2784 0.3529 0.9765;0.2784 0.3569 0.9804;0.2784 0.3647 0.9804;0.2745 0.3686 0.9843;0.2745 0.3765 0.9843;0.2745 0.3804 0.9882;0.2706 0.3843 0.9882;0.2706 0.3922 0.9922;0.2667 0.3961 0.9922;0.2627 0.4039 0.9922;0.2627 0.4078 0.9961;0.2588 0.4157 0.9961;0.2549 0.4196 0.9961;0.251 0.4275 0.9961;0.2471 0.4314 1;0.2431 0.4392 1;0.2353 0.4431 1;0.2314 0.451 1;0.2235 0.4549 1;0.2196 0.4627 0.9961;0.2118 0.4667 0.9961;0.2078 0.4745 0.9922;0.2 0.4784 0.9922;0.1961 0.4863 0.9882;0.1922 0.4902 0.9882;0.1882 0.498 0.9843;0.1843 0.502 0.9804;0.1843 0.5098 0.9804;0.1804 0.5137 0.9765;0.1804 0.5176 0.9725;0.1804 0.5255 0.9725;0.1804 0.5294 0.9686;0.1765 0.5333 0.9647;0.1765 0.5412 0.9608;0.1765 0.5451 0.9569;0.1765 0.549 0.9529;0.1765 0.5569 0.949;0.1725 0.5608 0.9451;0.1725 0.5647 0.9412;0.1686 0.5686 0.9373;0.1647 0.5765 0.9333;0.1608 0.5804 0.9294;0.1569 0.5843 0.9255;0.1529 0.5922 0.9216;0.1529 0.5961 0.9176;0.149 0.6 0.9137;0.149 0.6039 0.9098;0.1451 0.6078 0.9098;0.1451 0.6118 0.9059;0.1412 0.6196 0.902;0.1412 0.6235 0.898;0.1373 0.6275 0.898;0.1373 0.6314 0.8941;0.1333 0.6353 0.8941;0.1294 0.6392 0.8902;0.1255 0.6471 0.8902;0.1216 0.651 0.8863;0.1176 0.6549 0.8824;0.1137 0.6588 0.8824;0.1137 0.6627 0.8784;0.1098 0.6667 0.8745;0.1059 0.6706 0.8706;0.102 0.6745 0.8667;0.098 0.6784 0.8627;0.0902 0.6824 0.8549;0.0863 0.6863 0.851;0.0784 0.6902 0.8471;0.0706 0.6941 0.8392;0.0627 0.698 0.8353;0.0549 0.702 0.8314;0.0431 0.702 0.8235;0.0314 0.7059 0.8196;0.0235 0.7098 0.8118;0.0157 0.7137 0.8078;0.0078 0.7176 0.8;0.0039 0.7176 0.7922;0 0.7216 0.7882;0 0.7255 0.7804;0 0.7294 0.7765;0.0039 0.7294 0.7686;0.0078 0.7333 0.7608;0.0157 0.7333 0.7569;0.0235 0.7373 0.749;0.0353 0.7412 0.7412;0.051 0.7412 0.7373;0.0627 0.7451 0.7294;0.0784 0.7451 0.7216;0.0902 0.749 0.7137;0.102 0.7529 0.7098;0.1137 0.7529 0.702;0.1255 0.7569 0.6941;0.1373 0.7569 0.6863;0.1451 0.7608 0.6824;0.1529 0.7608 0.6745;0.1608 0.7647 0.6667;0.1686 0.7647 0.6588;0.1725 0.7686 0.651;0.1804 0.7686 0.6471;0.1843 0.7725 0.6392;0.1922 0.7725 0.6314;0.1961 0.7765 0.6235;0.2 0.7804 0.6157;0.2078 0.7804 0.6078;0.2118 0.7843 0.6;0.2196 0.7843 0.5882;0.2235 0.7882 0.5804;0.2314 0.7882 0.5725;0.2392 0.7922 0.5647;0.251 0.7922 0.5529;0.2588 0.7922 0.5451;0.2706 0.7961 0.5373;0.2824 0.7961 0.5255;0.2941 0.7961 0.5176;0.3059 0.8 0.5059;0.3176 0.8 0.498;0.3294 0.8 0.4863;0.3412 0.8 0.4784;0.3529 0.8 0.4667;0.3686 0.8039 0.4549;0.3804 0.8039 0.4471;0.3922 0.8039 0.4353;0.4039 0.8039 0.4235;0.4196 0.8039 0.4118;0.4314 0.8039 0.4;0.4471 0.8039 0.3922;0.4627 0.8 0.3804;0.4745 0.8 0.3686;0.4902 0.8 0.3569;0.5059 0.8 0.349;0.5176 0.8 0.3373;0.5333 0.7961 0.3255;0.5451 0.7961 0.3176;0.5608 0.7961 0.3059;0.5765 0.7922 0.2941;0.5882 0.7922 0.2824;0.6039 0.7882 0.2745;0.6157 0.7882 0.2627;0.6314 0.7843 0.251;0.6431 0.7843 0.2431;0.6549 0.7804 0.2314;0.6706 0.7804 0.2235;0.6824 0.7765 0.2157;0.698 0.7765 0.2078;0.7098 0.7725 0.2;0.7216 0.7686 0.1922;0.7333 0.7686 0.1843;0.7451 0.7647 0.1765;0.7608 0.7647 0.1725;0.7725 0.7608 0.1647;0.7843 0.7569 0.1608;0.7961 0.7569 0.1569;0.8078 0.7529 0.1529;0.8157 0.749 0.1529;0.8275 0.749 0.1529;0.8392 0.7451 0.1529;0.851 0.7451 0.1569;0.8588 0.7412 0.1569;0.8706 0.7373 0.1608;0.8824 0.7373 0.1647;0.8902 0.7373 0.1686;0.902 0.7333 0.1765;0.9098 0.7333 0.1804;0.9176 0.7294 0.1882;0.9255 0.7294 0.1961;0.9373 0.7294 0.2078;0.9451 0.7294 0.2157;0.9529 0.7294 0.2235;0.9608 0.7294 0.2314;0.9686 0.7294 0.2392;0.9765 0.7294 0.2431;0.9843 0.7333 0.2431;0.9882 0.7373 0.2431;0.9961 0.7412 0.2392;0.9961 0.7451 0.2353;0.9961 0.7529 0.2314;0.9961 0.7569 0.2275;0.9961 0.7608 0.2235;0.9961 0.7686 0.2196;0.9961 0.7725 0.2157;0.9961 0.7804 0.2078;0.9961 0.7843 0.2039;0.9961 0.7922 0.2;0.9922 0.7961 0.1961;0.9922 0.8039 0.1922;0.9922 0.8078 0.1922;0.9882 0.8157 0.1882;0.9843 0.8235 0.1843;0.9843 0.8275 0.1804;0.9804 0.8353 0.1804;0.9765 0.8392 0.1765;0.9765 0.8471 0.1725;0.9725 0.851 0.1686;0.9686 0.8588 0.1647;0.9686 0.8667 0.1647;0.9647 0.8706 0.1608;0.9647 0.8784 0.1569;0.9608 0.8824 0.1569;0.9608 0.8902 0.1529;0.9608 0.898 0.149;0.9608 0.902 0.149;0.9608 0.9098 0.1451;0.9608 0.9137 0.1412;0.9608 0.9216 0.1373;0.9608 0.9255 0.1333;0.9608 0.9333 0.1294;0.9608 0.9412 0.1294;0.9608 0.949 0.1216;0.9608 0.949 0.1216;0.9686 0.9608 0.1098;0.9686 0.9608 0.1098;0.9686 0.9686 0.102;0 0 0;1 1 1;1 1 1];
+            app.frobeniusErrorFigure.XTick = [];
+            app.frobeniusErrorFigure.YTick = [];
+            app.frobeniusErrorFigure.FontSize = 13;
+            app.frobeniusErrorFigure.NextPlot = 'replace';
+            app.frobeniusErrorFigure.Tag = 'frobeniusErrorFigure';
+            app.frobeniusErrorFigure.Position = [436 218 400 200];
+
+            % Create errorFigure
+            app.errorFigure = uiaxes(app.figure1);
+            app.errorFigure.Colormap = [0.2824 0.3294 0.9647;0.2784 0.3373 0.9686;0.2784 0.3412 0.9686;0.2784 0.349 0.9725;0.2784 0.3529 0.9765;0.2784 0.3569 0.9804;0.2784 0.3647 0.9804;0.2745 0.3686 0.9843;0.2745 0.3765 0.9843;0.2745 0.3804 0.9882;0.2706 0.3843 0.9882;0.2706 0.3922 0.9922;0.2667 0.3961 0.9922;0.2627 0.4039 0.9922;0.2627 0.4078 0.9961;0.2588 0.4157 0.9961;0.2549 0.4196 0.9961;0.251 0.4275 0.9961;0.2471 0.4314 1;0.2431 0.4392 1;0.2353 0.4431 1;0.2314 0.451 1;0.2235 0.4549 1;0.2196 0.4627 0.9961;0.2118 0.4667 0.9961;0.2078 0.4745 0.9922;0.2 0.4784 0.9922;0.1961 0.4863 0.9882;0.1922 0.4902 0.9882;0.1882 0.498 0.9843;0.1843 0.502 0.9804;0.1843 0.5098 0.9804;0.1804 0.5137 0.9765;0.1804 0.5176 0.9725;0.1804 0.5255 0.9725;0.1804 0.5294 0.9686;0.1765 0.5333 0.9647;0.1765 0.5412 0.9608;0.1765 0.5451 0.9569;0.1765 0.549 0.9529;0.1765 0.5569 0.949;0.1725 0.5608 0.9451;0.1725 0.5647 0.9412;0.1686 0.5686 0.9373;0.1647 0.5765 0.9333;0.1608 0.5804 0.9294;0.1569 0.5843 0.9255;0.1529 0.5922 0.9216;0.1529 0.5961 0.9176;0.149 0.6 0.9137;0.149 0.6039 0.9098;0.1451 0.6078 0.9098;0.1451 0.6118 0.9059;0.1412 0.6196 0.902;0.1412 0.6235 0.898;0.1373 0.6275 0.898;0.1373 0.6314 0.8941;0.1333 0.6353 0.8941;0.1294 0.6392 0.8902;0.1255 0.6471 0.8902;0.1216 0.651 0.8863;0.1176 0.6549 0.8824;0.1137 0.6588 0.8824;0.1137 0.6627 0.8784;0.1098 0.6667 0.8745;0.1059 0.6706 0.8706;0.102 0.6745 0.8667;0.098 0.6784 0.8627;0.0902 0.6824 0.8549;0.0863 0.6863 0.851;0.0784 0.6902 0.8471;0.0706 0.6941 0.8392;0.0627 0.698 0.8353;0.0549 0.702 0.8314;0.0431 0.702 0.8235;0.0314 0.7059 0.8196;0.0235 0.7098 0.8118;0.0157 0.7137 0.8078;0.0078 0.7176 0.8;0.0039 0.7176 0.7922;0 0.7216 0.7882;0 0.7255 0.7804;0 0.7294 0.7765;0.0039 0.7294 0.7686;0.0078 0.7333 0.7608;0.0157 0.7333 0.7569;0.0235 0.7373 0.749;0.0353 0.7412 0.7412;0.051 0.7412 0.7373;0.0627 0.7451 0.7294;0.0784 0.7451 0.7216;0.0902 0.749 0.7137;0.102 0.7529 0.7098;0.1137 0.7529 0.702;0.1255 0.7569 0.6941;0.1373 0.7569 0.6863;0.1451 0.7608 0.6824;0.1529 0.7608 0.6745;0.1608 0.7647 0.6667;0.1686 0.7647 0.6588;0.1725 0.7686 0.651;0.1804 0.7686 0.6471;0.1843 0.7725 0.6392;0.1922 0.7725 0.6314;0.1961 0.7765 0.6235;0.2 0.7804 0.6157;0.2078 0.7804 0.6078;0.2118 0.7843 0.6;0.2196 0.7843 0.5882;0.2235 0.7882 0.5804;0.2314 0.7882 0.5725;0.2392 0.7922 0.5647;0.251 0.7922 0.5529;0.2588 0.7922 0.5451;0.2706 0.7961 0.5373;0.2824 0.7961 0.5255;0.2941 0.7961 0.5176;0.3059 0.8 0.5059;0.3176 0.8 0.498;0.3294 0.8 0.4863;0.3412 0.8 0.4784;0.3529 0.8 0.4667;0.3686 0.8039 0.4549;0.3804 0.8039 0.4471;0.3922 0.8039 0.4353;0.4039 0.8039 0.4235;0.4196 0.8039 0.4118;0.4314 0.8039 0.4;0.4471 0.8039 0.3922;0.4627 0.8 0.3804;0.4745 0.8 0.3686;0.4902 0.8 0.3569;0.5059 0.8 0.349;0.5176 0.8 0.3373;0.5333 0.7961 0.3255;0.5451 0.7961 0.3176;0.5608 0.7961 0.3059;0.5765 0.7922 0.2941;0.5882 0.7922 0.2824;0.6039 0.7882 0.2745;0.6157 0.7882 0.2627;0.6314 0.7843 0.251;0.6431 0.7843 0.2431;0.6549 0.7804 0.2314;0.6706 0.7804 0.2235;0.6824 0.7765 0.2157;0.698 0.7765 0.2078;0.7098 0.7725 0.2;0.7216 0.7686 0.1922;0.7333 0.7686 0.1843;0.7451 0.7647 0.1765;0.7608 0.7647 0.1725;0.7725 0.7608 0.1647;0.7843 0.7569 0.1608;0.7961 0.7569 0.1569;0.8078 0.7529 0.1529;0.8157 0.749 0.1529;0.8275 0.749 0.1529;0.8392 0.7451 0.1529;0.851 0.7451 0.1569;0.8588 0.7412 0.1569;0.8706 0.7373 0.1608;0.8824 0.7373 0.1647;0.8902 0.7373 0.1686;0.902 0.7333 0.1765;0.9098 0.7333 0.1804;0.9176 0.7294 0.1882;0.9255 0.7294 0.1961;0.9373 0.7294 0.2078;0.9451 0.7294 0.2157;0.9529 0.7294 0.2235;0.9608 0.7294 0.2314;0.9686 0.7294 0.2392;0.9765 0.7294 0.2431;0.9843 0.7333 0.2431;0.9882 0.7373 0.2431;0.9961 0.7412 0.2392;0.9961 0.7451 0.2353;0.9961 0.7529 0.2314;0.9961 0.7569 0.2275;0.9961 0.7608 0.2235;0.9961 0.7686 0.2196;0.9961 0.7725 0.2157;0.9961 0.7804 0.2078;0.9961 0.7843 0.2039;0.9961 0.7922 0.2;0.9922 0.7961 0.1961;0.9922 0.8039 0.1922;0.9922 0.8078 0.1922;0.9882 0.8157 0.1882;0.9843 0.8235 0.1843;0.9843 0.8275 0.1804;0.9804 0.8353 0.1804;0.9765 0.8392 0.1765;0.9765 0.8471 0.1725;0.9725 0.851 0.1686;0.9686 0.8588 0.1647;0.9686 0.8667 0.1647;0.9647 0.8706 0.1608;0.9647 0.8784 0.1569;0.9608 0.8824 0.1569;0.9608 0.8902 0.1529;0.9608 0.898 0.149;0.9608 0.902 0.149;0.9608 0.9098 0.1451;0.9608 0.9137 0.1412;0.9608 0.9216 0.1373;0.9608 0.9255 0.1333;0.9608 0.9333 0.1294;0.9608 0.9412 0.1294;0.9608 0.949 0.1216;0.9608 0.949 0.1216;0.9686 0.9608 0.1098;0.9686 0.9608 0.1098;0.9686 0.9686 0.102;0 0 0;1 1 1;1 1 1];
+            app.errorFigure.XTick = [];
+            app.errorFigure.YTick = [];
+            app.errorFigure.FontSize = 13;
+            app.errorFigure.NextPlot = 'replace';
+            app.errorFigure.Tag = 'errorFigure';
+            app.errorFigure.Position = [436 11 400 200];
+
+            % Show the figure after all components are created
+            app.figure1.Visible = 'on';
+        end
+    end
+
+    % App creation and deletion
+    methods (Access = public)
+
+        % Construct app
+        function app = kron_App_published(varargin)
+
+            runningApp = getRunningApp(app);
+
+            % Check for running singleton app
+            if isempty(runningApp)
+
+                % Create UIFigure and components
+                createComponents(app)
+
+                % Register the app with App Designer
+                registerApp(app, app.figure1)
+
+                % Execute the startup function
+                runStartupFcn(app, @(app)kron_OpeningFcn(app, varargin{:}))
+            else
+
+                % Focus the running singleton app
+                figure(runningApp.figure1)
+
+                app = runningApp;
+            end
+
+            if nargout == 0
+                clear app
+            end
+        end
+
+        % Code that executes before app deletion
+        function delete(app)
+
+            % Delete UIFigure when app is deleted
+            delete(app.figure1)
+        end
+    end
+end
